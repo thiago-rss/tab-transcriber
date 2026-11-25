@@ -1,0 +1,16 @@
+target/
+**/*.rs.bk
+node_modules/
+apps/desktop/dist/
+apps/desktop/src-tauri/gen/
+apps/desktop/src-tauri/target/
+.venv-stems/
+__pycache__/
+*.py[cod]
+models/
+*.onnx
+*.sf2
+*.wav
+*.mid
+*.musicxml
+.DS_Store

@@ -1,0 +1,382 @@
+:root {
+  --bg: #111317;
+  --panel: #181b21;
+  --border: #2a2f3a;
+  --text: #eceff4;
+  --muted: #8b95a5;
+  --accent: #d4a853;
+  --accent-active: #e3b963;
+  --danger: #d9534f;
+  --ok: #4caf7d;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.app-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 20px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-bottom: 6px;
+}
+
+.brand h1 {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--muted);
+  transition: background 0.2s ease, box-shadow 0.2s ease;
+}
+
+.dot.live {
+  background: var(--ok);
+  box-shadow: 0 0 8px rgba(76, 175, 125, 0.7);
+}
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.field > span {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.source-row {
+  display: flex;
+  gap: 6px;
+}
+
+select,
+button {
+  height: 32px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 13px;
+  padding: 0 10px;
+}
+
+select {
+  min-width: 155px;
+  cursor: pointer;
+}
+
+#source-select {
+  min-width: 220px;
+}
+
+#speed-select {
+  min-width: 120px;
+  height: 28px;
+  font-size: 12px;
+}
+
+button {
+  cursor: pointer;
+  font-weight: 500;
+  transition: background 0.15s ease, border-color 0.15s ease, opacity 0.15s ease;
+}
+
+button:hover:not(:disabled) {
+  border-color: #464e5e;
+  background: #1f232b;
+}
+
+button:disabled,
+select:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #141414;
+  font-weight: 600;
+  padding: 0 16px;
+}
+
+button.primary:hover:not(:disabled) {
+  background: var(--accent-active);
+}
+
+button.primary.running {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+}
+
+button.toggle-active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: rgba(212, 168, 83, 0.12);
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+}
+
+.telemetry-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 8px 20px;
+  background: #14171c;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+
+.player-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 20px;
+  background: #161920;
+  border-bottom: 1px solid var(--border);
+}
+
+.player-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.player-controls button {
+  height: 28px;
+  font-size: 12px;
+  padding: 0 12px;
+}
+
+.player-meta {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.sf-badge {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.sf-badge.ready {
+  color: var(--ok);
+}
+
+.meter-group,
+.notes-group,
+.status-group {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.label {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+
+.meter-track {
+  width: 130px;
+  height: 6px;
+  background: #252a34;
+  border-radius: 99px;
+  overflow: hidden;
+}
+
+.meter-fill {
+  width: 0%;
+  height: 100%;
+  background: linear-gradient(90deg, var(--ok) 0%, var(--accent) 78%, var(--danger) 100%);
+  transition: width 70ms linear;
+}
+
+.mono {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+}
+
+.highlight {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.warning {
+  padding: 8px 20px;
+  background: rgba(217, 83, 79, 0.15);
+  border-bottom: 1px solid rgba(217, 83, 79, 0.4);
+  color: #f4b4b2;
+  font-size: 12px;
+}
+
+.hidden {
+  display: none;
+}
+
+.score-viewport {
+  flex: 1;
+  overflow-y: auto;
+  padding: 24px;
+  background: #0d0f13;
+}
+
+.score-canvas {
+  position: relative;
+  max-width: 1060px;
+  margin: 0 auto;
+  min-height: 420px;
+  padding: 20px 24px;
+  background: #faf9f6;
+  color: #111;
+  border-radius: 10px;
+  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.45);
+}
+
+/* ============================================================
+   Cursor sincronizado e realce de notas do AlphaTab
+   ============================================================ */
+.at-cursor-bar {
+  background: rgba(212, 168, 83, 0.18);
+}
+
+.at-cursor-beat {
+  background: rgba(212, 168, 83, 0.92);
+  width: 3px;
+}
+
+.at-highlight * {
+  fill: #b8841f;
+  stroke: #b8841f;
+}
+
+.at-selection div {
+  background: rgba(212, 168, 83, 0.14);
+}
+
+/* ============================================================
+   Barra de Separação Neural (HTDemucs 6-stems)
+   ============================================================ */
+.stems-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 20px;
+  background: #1a1d26;
+  border-bottom: 1px solid var(--border);
+}
+
+.stems-controls,
+.stems-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.stems-controls button,
+.stems-controls select {
+  height: 28px;
+  font-size: 12px;
+}
+
+.stems-controls select {
+  min-width: 145px;
+}
+
+button.rec-btn {
+  border-color: rgba(217, 83, 79, 0.55);
+  color: #f3a6a4;
+  background: rgba(217, 83, 79, 0.12);
+  padding: 0 12px;
+}
+
+button.rec-btn:hover:not(:disabled) {
+  background: rgba(217, 83, 79, 0.24);
+  border-color: var(--danger);
+}
+
+button.rec-btn.recording {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+  font-weight: 600;
+}
+
+.divider {
+  width: 1px;
+  height: 18px;
+  background: var(--border);
+  margin: 0 2px;
+}
+
+.stem-seek {
+  width: 130px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.stem-seek:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.mini-btn {
+  height: 20px;
+  padding: 0 6px;
+  font-size: 10px;
+  line-height: 1;
+  color: var(--muted);
+}

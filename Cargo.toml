@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/audio-capture",
+    "crates/dsp-pitch",
+    "crates/poly-transcriber",
+    "crates/tab-solver",
+    "crates/music-theory",
+    "crates/stem-separator",
+    "apps/cli",
+    "apps/desktop/src-tauri",
+]

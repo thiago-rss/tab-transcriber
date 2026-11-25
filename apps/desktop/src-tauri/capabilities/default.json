@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Permissões básicas para a janela principal do Tab Transcriber",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

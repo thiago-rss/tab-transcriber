@@ -432,6 +432,31 @@ impl InstrumentFilter {
         }
     }
 
+    /// Filtro otimizado para redes CQT (Basic Pitch): aplica apenas HPF subsônico para não cortar
+    /// os harmônicos superiores que o empilhamento harmônico da rede usa para estimar a fundamental.
+    pub fn new_for_poly(sample_rate: f32, focus: InstrumentFocus) -> Self {
+        const Q1: f32 = 0.541_196_1;
+        const Q2: f32 = 1.306_563;
+
+        let hp_hz = match focus {
+            InstrumentFocus::FullMix | InstrumentFocus::PianoKeys => 25.0,
+            InstrumentFocus::Bass => 26.0,
+            InstrumentFocus::OudLute | InstrumentFocus::BowedStrings => 55.0,
+            InstrumentFocus::GuitarLead | InstrumentFocus::AcousticBright => 70.0,
+            InstrumentFocus::Vocals | InstrumentFocus::WindsBrass => 90.0,
+            InstrumentFocus::GuitarSolo => 180.0,
+        };
+
+        Self {
+            focus,
+            hpf1: Biquad::highpass(sample_rate, hp_hz, Q1),
+            hpf2: Biquad::highpass(sample_rate, hp_hz, Q2),
+            lpf1: Biquad::bypass(),
+            lpf2: Biquad::bypass(),
+            use_lpf: false,
+        }
+    }
+
     pub fn focus(&self) -> InstrumentFocus {
         self.focus
     }

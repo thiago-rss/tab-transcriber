@@ -1,4 +1,7 @@
 mod alphatex;
+mod audio_import;
+mod resources;
+mod session_store;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
@@ -16,17 +19,18 @@ use dsp_pitch::{
     YinDetector,
 };
 use music_theory::{
-    build_quantized_score, export_midi, export_musicxml, midi_to_note_name_for_key,
-    score_to_alphatex, QuantizedScore, TimeSignature, TimedEvent,
+    build_quantized_score, export_midi, export_musicxml, infer_optimal_clef,
+    midi_to_note_name_for_key, score_to_alphatex, ClefKind, QuantizedScore, TimeSignature,
+    TimedEvent,
 };
 use poly_transcriber::{
-    BasicPitchEngine, DecodeConfig, SincResampler, FRAME_DURATION_MS, MODEL_SAMPLE_RATE,
+    BasicPitchEngine, DecodeConfig, SincResampler, FFT_HOP, FRAME_DURATION_MS, MODEL_SAMPLE_RATE,
     MODEL_WINDOW_SAMPLES,
 };
 use serde::{Deserialize, Serialize};
 use stem_separator::{
-    check_stems_backend as detect_stems_backend, separate_with_htdemucs_6s,
-    transcribe_stem_offline_with_engine, write_stereo_wav_pcm24, BackendStatus,
+    check_neural_backend as detect_neural_backend, check_stems_backend as detect_stems_backend, load_stem_bundle_from_dir, separate_with_htdemucs_6s,
+    transcribe_stem_offline_with_engine, write_stereo_wav_pcm24, BackendStatus, NeuralBackendStatus,
     OfflineTranscribeParams, StemActivity, StemBundle,
 };
 use tab_solver::{
@@ -34,7 +38,7 @@ use tab_solver::{
     SolverConfig,
 };
 use tauri::ipc::Response;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use alphatex::{empty_score_tex, get_tuning_preset};
 
@@ -43,6 +47,7 @@ const YIN_WINDOW_SIZE: usize = 2048;
 const YIN_HOP_SIZE: usize = 512;
 const MAX_SCORE_EVENTS: usize = 64;
 const MAX_SNIPPET_SECONDS: usize = 90;
+const MAX_LOOPBACK_REC_SECONDS: usize = 300; // até 5 min de WAV 24-bit no modo Loopback Puro
 
 fn default_focus() -> String {
     "full".to_string()
@@ -56,11 +61,17 @@ fn default_stereo_mode() -> String {
 fn default_neck_region() -> String {
     "auto".to_string()
 }
+fn default_clef_mode() -> String {
+    "auto".to_string()
+}
 fn default_stem() -> String {
     "guitar".to_string()
 }
 fn default_stem_quality() -> String {
     "high".to_string()
+}
+fn default_neural_engine() -> String {
+    "auto".to_string()
 }
 fn default_true() -> bool {
     true
@@ -94,6 +105,8 @@ pub struct StartConfig {
     pub enable_hpss: bool,
     #[serde(default = "default_neck_region")]
     pub neck_region: String,
+    #[serde(default = "default_clef_mode")]
+    pub clef_mode: String,
     #[serde(default)]
     pub prefer_closed: bool,
     #[serde(default = "default_true")]
@@ -113,10 +126,14 @@ pub struct StemTranscribeConfig {
     pub time_signature: String,
     #[serde(default = "default_neck_region")]
     pub neck_region: String,
+    #[serde(default = "default_clef_mode")]
+    pub clef_mode: String,
     #[serde(default)]
     pub prefer_closed: bool,
     #[serde(default = "default_stem_quality")]
     pub quality: String,
+    #[serde(default = "default_neural_engine")]
+    pub neural_engine: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -179,10 +196,18 @@ struct SnippetRecorderSession {
     worker: Option<JoinHandle<Result<(u32, Vec<[f32; 2]>), String>>>,
 }
 
+struct LoopbackOnlySession {
+    stop_flag: Arc<AtomicBool>,
+    record_wav: bool,
+    worker: Option<JoinHandle<Result<(u32, Vec<[f32; 2]>), String>>>,
+}
+
 struct ScoreSnapshot {
     events: Vec<TimedEvent>,
     voicings: Vec<Option<ChordVoicing>>,
     tuning_id: String,
+    clef: ClefKind,
+    show_tab_staff: bool,
     time_sig: TimeSignature,
     detected_instrument: String,
     score: QuantizedScore,
@@ -191,9 +216,11 @@ struct ScoreSnapshot {
 struct AppState {
     session: Arc<Mutex<Option<RunningSession>>>,
     snippet_recorder: Arc<Mutex<Option<SnippetRecorderSession>>>,
+    loopback_only: Arc<Mutex<Option<LoopbackOnlySession>>>,
     engine_cache: Arc<Mutex<Option<BasicPitchEngine>>>,
     active_stems: Arc<Mutex<Option<StemBundle>>>,
     active_tuning: Mutex<String>,
+    active_clef_mode: Mutex<String>,
     active_time_signature: Mutex<TimeSignature>,
     latest_snapshot: Arc<Mutex<Option<ScoreSnapshot>>>,
 }
@@ -203,9 +230,11 @@ impl Default for AppState {
         Self {
             session: Arc::new(Mutex::new(None)),
             snippet_recorder: Arc::new(Mutex::new(None)),
+            loopback_only: Arc::new(Mutex::new(None)),
             engine_cache: Arc::new(Mutex::new(None)),
             active_stems: Arc::new(Mutex::new(None)),
-            active_tuning: Mutex::new("standard".to_string()),
+            active_tuning: Mutex::new("auto".to_string()),
+            active_clef_mode: Mutex::new("auto".to_string()),
             active_time_signature: Mutex::new(TimeSignature::default()),
             latest_snapshot: Arc::new(Mutex::new(None)),
         }
@@ -213,11 +242,7 @@ impl Default for AppState {
 }
 
 fn workspace_root_dir() -> PathBuf {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest_dir
-        .join("../../..")
-        .canonicalize()
-        .unwrap_or_else(|_| manifest_dir.join("../../.."))
+    resources::resolve_stems_root()
 }
 
 fn exports_dir() -> Result<PathBuf, String> {
@@ -229,27 +254,9 @@ fn exports_dir() -> Result<PathBuf, String> {
 }
 
 fn resolve_model_path() -> Result<PathBuf, String> {
-    let root = workspace_root_dir();
-    let candidates = [
-        root.join("models/nmp.onnx"),
-        PathBuf::from("models/nmp.onnx"),
-        PathBuf::from("../../models/nmp.onnx"),
-        PathBuf::from("../../../models/nmp.onnx"),
-    ];
-
-    for path in candidates {
-        if path.exists() {
-            return Ok(path);
-        }
-    }
-
-    Err(
-        "Modelo ONNX 'models/nmp.onnx' não encontrado. Confirme que ele foi baixado em ~/tab-transcriber/models/nmp.onnx."
-            .to_string(),
-    )
+    resources::resolve_model_path()
 }
 
-/// Carrega o BasicPitchEngine uma única vez e mantém em cache no AppState.
 fn ensure_engine_loaded(cache: &Arc<Mutex<Option<BasicPitchEngine>>>) -> Result<(), String> {
     let mut guard = cache.lock().unwrap();
     if guard.is_none() {
@@ -261,10 +268,11 @@ fn ensure_engine_loaded(cache: &Arc<Mutex<Option<BasicPitchEngine>>>) -> Result<
     Ok(())
 }
 
-/// Para qualquer captura ativa (Ao Vivo ou Gravação de Trecho) fora do lock e aguarda liberação do HAL.
+/// Encerra qualquer captura ativa (Ao Vivo, Gravação de Stems ou Loopback Puro) com drenagem limpa do HAL.
 fn teardown_all_captures_blocking(
     session_arc: &Arc<Mutex<Option<RunningSession>>>,
     recorder_arc: &Arc<Mutex<Option<SnippetRecorderSession>>>,
+    loopback_arc: &Arc<Mutex<Option<LoopbackOnlySession>>>,
 ) {
     let mut stopped_any = false;
 
@@ -284,12 +292,19 @@ fn teardown_all_captures_blocking(
         stopped_any = true;
     }
 
+    if let Some(mut lb) = loopback_arc.lock().unwrap().take() {
+        lb.stop_flag.store(true, Ordering::SeqCst);
+        if let Some(handle) = lb.worker.take() {
+            let _ = handle.join();
+        }
+        stopped_any = true;
+    }
+
     if stopped_any {
         thread::sleep(Duration::from_millis(60));
     }
 }
 
-/// Re-resolve os ObjectIDs atuais no Core Audio a partir do bundle_id (evita IDs vencidos na troca de modo).
 fn resolve_fresh_capture_target(source_id: Option<&str>, fallback_ids: &[u32]) -> CaptureTarget {
     if let Some(id) = source_id {
         if id.is_empty() || id == "__global__" {
@@ -352,6 +367,7 @@ fn build_offline_params(
     let time_sig = TimeSignature::from_str_id(&cfg.time_signature);
     let focus = InstrumentFocus::from_str_id(&cfg.focus);
     let region = NeckRegion::from_str_id(&cfg.neck_region);
+    let clef_override = ClefKind::from_str_id(&cfg.clef_mode);
 
     OfflineTranscribeParams {
         stem_name: cfg.stem.clone(),
@@ -362,6 +378,7 @@ fn build_offline_params(
         midi_program: preset.midi_program,
         show_tab_staff: preset.show_tab_staff,
         clef: preset.clef,
+        clef_override,
         allow_bends: preset.allow_bends,
         solver_cfg: SolverConfig {
             region,
@@ -372,7 +389,14 @@ fn build_offline_params(
         bpm_override: cfg.bpm,
         focus,
         model_path,
+        neural_engine: cfg.neural_engine.clone(),
+        neural_root: Some(workspace_root_dir()),
     }
+}
+
+#[tauri::command]
+fn check_neural_backend() -> NeuralBackendStatus {
+    detect_neural_backend(&workspace_root_dir())
 }
 
 #[tauri::command]
@@ -441,21 +465,27 @@ fn list_audio_sources(only_active: bool) -> Vec<AudioSourceDto> {
 }
 
 #[tauri::command]
-fn get_initial_tex(tuning: String, time_signature: Option<String>) -> String {
+fn get_initial_tex(
+    tuning: String,
+    time_signature: Option<String>,
+    clef_mode: Option<String>,
+) -> String {
     let preset = get_tuning_preset(&tuning);
     let ts = time_signature
         .as_deref()
         .map(TimeSignature::from_str_id)
         .unwrap_or_default();
-    empty_score_tex(&preset, ts)
+    let clef_ov = clef_mode.as_deref().and_then(ClefKind::from_str_id);
+    empty_score_tex(&preset, ts, clef_ov)
 }
 
 #[tauri::command]
 async fn stop_transcription(state: State<'_, AppState>) -> Result<(), String> {
     let session_arc = Arc::clone(&state.session);
     let recorder_arc = Arc::clone(&state.snippet_recorder);
+    let loopback_arc = Arc::clone(&state.loopback_only);
     tauri::async_runtime::spawn_blocking(move || {
-        teardown_all_captures_blocking(&session_arc, &recorder_arc);
+        teardown_all_captures_blocking(&session_arc, &recorder_arc, &loopback_arc);
     })
     .await
     .map_err(|e| format!("Falha ao encerrar captura: {}", e))?;
@@ -466,19 +496,192 @@ async fn stop_transcription(state: State<'_, AppState>) -> Result<(), String> {
 async fn cancel_snippet_recording(state: State<'_, AppState>) -> Result<(), String> {
     let session_arc = Arc::clone(&state.session);
     let recorder_arc = Arc::clone(&state.snippet_recorder);
+    let loopback_arc = Arc::clone(&state.loopback_only);
     tauri::async_runtime::spawn_blocking(move || {
-        teardown_all_captures_blocking(&session_arc, &recorder_arc);
+        teardown_all_captures_blocking(&session_arc, &recorder_arc, &loopback_arc);
     })
     .await
     .map_err(|e| format!("Falha ao cancelar gravação: {}", e))?;
     Ok(())
 }
 
+// ============================================================================
+// MODO LOOPBACK PURO (ZERO TRANSCRIÇÃO — MONITORAMENTO + WAV 24-BIT OPCIONAL)
+// ============================================================================
+
+#[tauri::command]
+async fn start_loopback_only(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    target_ids: Vec<u32>,
+    source_id: Option<String>,
+    record_wav: bool,
+) -> Result<String, String> {
+    let session_arc = Arc::clone(&state.session);
+    let recorder_arc = Arc::clone(&state.snippet_recorder);
+    let loopback_arc = Arc::clone(&state.loopback_only);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        teardown_all_captures_blocking(&session_arc, &recorder_arc, &loopback_arc);
+
+        let target = resolve_fresh_capture_target(source_id.as_deref(), &target_ids);
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop_flag);
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<(u32, String), String>>();
+
+        let worker = thread::spawn(move || -> Result<(u32, Vec<[f32; 2]>), String> {
+            let (loopback, mut consumer) =
+                match MacOSLoopbackCapture::start_with_target(RING_CAPACITY_FRAMES, target) {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e.clone()));
+                        return Err(e);
+                    }
+                };
+
+            let sample_rate = loopback.current_sample_rate().round() as u32;
+            let fmt_label = loopback.format_label();
+            let _ = ready_tx.send(Ok((sample_rate, fmt_label)));
+
+            let max_frames = (sample_rate as usize) * MAX_LOOPBACK_REC_SECONDS;
+            let mut recorded: Vec<[f32; 2]> = if record_wav {
+                Vec::with_capacity((sample_rate as usize) * 30)
+            } else {
+                Vec::new()
+            };
+            let mut read_chunk = [[0.0f32; 2]; 1024];
+            let mut zero_chunks = 0u32;
+            let mut last_ui_tick = Instant::now();
+
+            while !stop_clone.load(Ordering::Relaxed) {
+                let (popped, _) = consumer.pop_partial_slice(&mut read_chunk);
+                if popped.is_empty() {
+                    thread::sleep(Duration::from_millis(4));
+                    continue;
+                }
+
+                if record_wav && recorded.len() < max_frames {
+                    let take = popped.len().min(max_frames - recorded.len());
+                    recorded.extend_from_slice(&popped[..take]);
+                }
+
+                let mut sum_sq = 0.0f64;
+                let mut peak = 0.0f32;
+                for fr in popped.iter() {
+                    let m = 0.5 * (fr[0] + fr[1]);
+                    peak = peak.max(fr[0].abs()).max(fr[1].abs());
+                    sum_sq += (m as f64) * (m as f64);
+                }
+
+                if peak == 0.0 {
+                    zero_chunks = zero_chunks.saturating_add(1);
+                } else {
+                    zero_chunks = 0;
+                }
+
+                if last_ui_tick.elapsed() >= Duration::from_millis(80) {
+                    last_ui_tick = Instant::now();
+                    let rms = (sum_sq / popped.len().max(1) as f64).sqrt() as f32;
+                    let rms_db = 20.0 * rms.max(1e-7).log10();
+                    let peak_db = 20.0 * peak.max(1e-7).log10();
+                    let _ = app.emit(
+                        "audio-level",
+                        AudioLevelPayload {
+                            rms_db,
+                            peak_db,
+                            silence_warning: zero_chunks >= 45,
+                            dropped_samples: loopback.dropped_samples(),
+                            device_switches: loopback.device_switches(),
+                            clip_events: loopback.clip_events(),
+                            clock_glitches: loopback.clock_glitches(),
+                            phase_corr: compute_phase_correlation(popped),
+                            sample_rate: loopback.current_sample_rate().round() as u32,
+                            format_label: loopback.format_label(),
+                        },
+                    );
+                }
+            }
+
+            let final_sr = loopback.current_sample_rate().round() as u32;
+            Ok((final_sr, recorded))
+        });
+
+        match ready_rx.recv() {
+            Ok(Ok((sr, fmt))) => {
+                *loopback_arc.lock().unwrap() = Some(LoopbackOnlySession {
+                    stop_flag,
+                    record_wav,
+                    worker: Some(worker),
+                });
+                let suffix = if record_wav {
+                    "gravando WAV 24-bit"
+                } else {
+                    "somente monitor (sem transcrição)"
+                };
+                Ok(format!("Loopback puro {} Hz ({}) · {}", sr, fmt, suffix))
+            }
+            Ok(Err(err)) => {
+                let _ = worker.join();
+                Err(err)
+            }
+            Err(_) => {
+                let _ = worker.join();
+                Err("Loopback encerrou inesperadamente.".to_string())
+            }
+        }
+    })
+    .await
+    .map_err(|e| format!("Falha ao iniciar loopback puro: {}", e))?
+}
+
+#[tauri::command]
+async fn stop_loopback_only(state: State<'_, AppState>) -> Result<String, String> {
+    let lb_opt = { state.loopback_only.lock().unwrap().take() };
+    let Some(mut lb) = lb_opt else {
+        return Ok("Loopback parado".to_string());
+    };
+    lb.stop_flag.store(true, Ordering::SeqCst);
+
+    let base_exports = exports_dir()?;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(handle) = lb.worker.take() else {
+            return Ok("Loopback parado".to_string());
+        };
+        let (sample_rate, frames) = handle
+            .join()
+            .map_err(|_| "Falha ao encerrar thread de loopback.".to_string())??;
+
+        if lb.record_wav && !frames.is_empty() {
+            let rec_dir = base_exports.join("recordings");
+            fs::create_dir_all(&rec_dir)
+                .map_err(|e| format!("Erro ao criar pasta recordings: {}", e))?;
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let wav_path = rec_dir.join(format!("loopback_{}.wav", ts));
+            write_stereo_wav_pcm24(&wav_path, sample_rate, &frames)?;
+            let secs = (frames.len() as f64) / (sample_rate.max(1) as f64);
+            return Ok(format!(
+                "WAV 24-bit salvo ({:.1}s): recordings/loopback_{}.wav",
+                secs, ts
+            ));
+        }
+
+        Ok("Loopback puro parado".to_string())
+    })
+    .await
+    .map_err(|e| format!("Erro ao finalizar loopback: {}", e))?
+}
+
 #[tauri::command]
 fn clear_transcription(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let tuning = state.active_tuning.lock().unwrap().clone();
+    let clef_mode = state.active_clef_mode.lock().unwrap().clone();
     let ts = *state.active_time_signature.lock().unwrap();
     let preset = get_tuning_preset(&tuning);
+    let clef_ov = ClefKind::from_str_id(&clef_mode);
 
     if let Some(sess) = state.session.lock().unwrap().as_ref() {
         sess.clear_flag.store(true, Ordering::SeqCst);
@@ -488,7 +691,7 @@ fn clear_transcription(app: AppHandle, state: State<'_, AppState>) -> Result<(),
     let _ = app.emit(
         "transcription-update",
         TranscriptionUpdatePayload {
-            alphatex: empty_score_tex(&preset, ts),
+            alphatex: empty_score_tex(&preset, ts, clef_ov),
             latest_notes: vec![],
             latest_chord: None,
             detected_key: "—".to_string(),
@@ -506,7 +709,6 @@ fn clear_transcription(app: AppHandle, state: State<'_, AppState>) -> Result<(),
     Ok(())
 }
 
-/// Re-quantiza imediatamente a partitura atual em ½× ou 2× BPM sem regravar.
 #[tauri::command]
 fn rescale_score_bpm(
     app: AppHandle,
@@ -522,27 +724,19 @@ fn rescale_score_bpm(
     let preset = get_tuning_preset(&snap.tuning_id);
 
     let q_score = build_quantized_score(
-        "Tab Transcriber",
+        "",
         &snap.events,
         &snap.voicings,
         &preset.midi_low_to_high,
         Some(new_bpm),
         snap.time_sig,
     )
-    .with_instrument(preset.midi_program, preset.show_tab_staff, preset.clef);
+    .with_instrument(preset.midi_program, snap.show_tab_staff, snap.clef);
 
     let detected_key = q_score.key.display_name();
     let latest_chord = latest_chord_label(&q_score);
     let key_obj = q_score.key;
-    let subtitle = format!(
-        "{} · {} — {} · {} · {} BPM",
-        snap.detected_instrument,
-        preset.label,
-        detected_key,
-        snap.time_sig.display_label(),
-        new_bpm
-    );
-    let alphatex = score_to_alphatex(&q_score, preset.alphatex_high_to_low, &subtitle);
+    let alphatex = score_to_alphatex(&q_score, preset.alphatex_high_to_low, "");
 
     let latest_notes = snap
         .events
@@ -626,7 +820,7 @@ fn open_exports_folder() -> Result<(), String> {
 }
 
 // ============================================================================
-// CAPTURA DE TRECHO + HTDEMUCS 6-STEMS (ASSÍNCRONO, SEM TRAVAR TROCA DE MODO)
+// CAPTURA DE TRECHO + HTDEMUCS 6-STEMS
 // ============================================================================
 
 #[tauri::command]
@@ -638,9 +832,10 @@ async fn start_snippet_recording(
 ) -> Result<String, String> {
     let session_arc = Arc::clone(&state.session);
     let recorder_arc = Arc::clone(&state.snippet_recorder);
+    let loopback_arc = Arc::clone(&state.loopback_only);
 
     tauri::async_runtime::spawn_blocking(move || {
-        teardown_all_captures_blocking(&session_arc, &recorder_arc);
+        teardown_all_captures_blocking(&session_arc, &recorder_arc, &loopback_arc);
 
         let target = resolve_fresh_capture_target(source_id.as_deref(), &target_ids);
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -759,6 +954,7 @@ async fn stop_and_separate_snippet(
     rec.stop_flag.store(true, Ordering::SeqCst);
 
     *state.active_tuning.lock().unwrap() = config.tuning.clone();
+    *state.active_clef_mode.lock().unwrap() = config.clef_mode.clone();
     *state.active_time_signature.lock().unwrap() = TimeSignature::from_str_id(&config.time_signature);
 
     let root_dir = workspace_root_dir();
@@ -799,8 +995,8 @@ async fn stop_and_separate_snippet(
             "Separando 6 stems com HTDemucs (guitar, bass, piano, vocals, other)…",
         );
         let bundle = separate_with_htdemucs_6s(&mix_wav, &session_dir, &root_dir, &config.quality)?;
+        let _ = session_store::save_session_manifest(&bundle, &format!("Trecho #{}", ts % 10000), "snippet");
 
-        // Se o stem escolhido estiver silencioso, escolhe automaticamente o stem melódico ativo mais forte
         let target_stem = bundle.best_melodic_stem_or(&config.stem);
         let stem_wav = bundle
             .wav_for_stem(&target_stem)
@@ -836,8 +1032,9 @@ async fn stop_and_separate_snippet(
         let detected_bpm = out.score.bpm;
         let ts_label = out.score.time_signature.display_label();
         let time_sig = out.score.time_signature;
+        let eff_clef = out.score.clef;
+        let eff_show_tab = out.score.show_tab_staff;
 
-        // Reconstrói lista simples de eventos/voicings para permitir ½× / 2× instantâneo
         let snap_events: Vec<TimedEvent> = out
             .score
             .measures
@@ -865,6 +1062,8 @@ async fn stop_and_separate_snippet(
             events: snap_events,
             voicings: snap_voicings,
             tuning_id: cfg_eff.tuning.clone(),
+            clef: eff_clef,
+            show_tab_staff: eff_show_tab,
             time_sig,
             detected_instrument: out.detected_instrument.clone(),
             score: out.score,
@@ -925,6 +1124,7 @@ async fn transcribe_existing_stem(
         .ok_or_else(|| format!("Stem '{}' não disponível nesta sessão.", config.stem))?;
 
     *state.active_tuning.lock().unwrap() = config.tuning.clone();
+    *state.active_clef_mode.lock().unwrap() = config.clef_mode.clone();
     *state.active_time_signature.lock().unwrap() = TimeSignature::from_str_id(&config.time_signature);
 
     let latest_snap_arc = Arc::clone(&state.latest_snapshot);
@@ -948,6 +1148,8 @@ async fn transcribe_existing_stem(
         let detected_bpm = out.score.bpm;
         let ts_label = out.score.time_signature.display_label();
         let time_sig = out.score.time_signature;
+        let eff_clef = out.score.clef;
+        let eff_show_tab = out.score.show_tab_staff;
 
         let snap_events: Vec<TimedEvent> = out
             .score
@@ -976,6 +1178,8 @@ async fn transcribe_existing_stem(
             events: snap_events,
             voicings: snap_voicings,
             tuning_id: config.tuning.clone(),
+            clef: eff_clef,
+            show_tab_staff: eff_show_tab,
             time_sig,
             detected_instrument: out.detected_instrument.clone(),
             score: out.score,
@@ -1001,8 +1205,8 @@ async fn transcribe_existing_stem(
         );
 
         Ok(format!(
-            "Stem '{}' transcrito ({} eventos em {} ms)",
-            stem_label, out.event_count, out.elapsed_ms
+            "Stem '{}' via {} ({} eventos em {} ms)",
+            stem_label, out.engine_used, out.event_count, out.elapsed_ms
         ))
     })
     .await
@@ -1010,7 +1214,7 @@ async fn transcribe_existing_stem(
 }
 
 // ============================================================================
-// MODO AO VIVO (ASSÍNCRONO + ENGINE EM CACHE + RE-RESOLUÇÃO DE APP)
+// MODO AO VIVO (JANELA CENTRAL 43..129 EXATA + FILTRO CQT + SEPARAÇÃO CLAVES)
 // ============================================================================
 
 #[tauri::command]
@@ -1021,21 +1225,24 @@ async fn start_transcription(
 ) -> Result<String, String> {
     let time_sig = TimeSignature::from_str_id(&config.time_signature);
     *state.active_tuning.lock().unwrap() = config.tuning.clone();
+    *state.active_clef_mode.lock().unwrap() = config.clef_mode.clone();
     *state.active_time_signature.lock().unwrap() = time_sig;
 
     let session_arc = Arc::clone(&state.session);
     let recorder_arc = Arc::clone(&state.snippet_recorder);
+    let loopback_arc = Arc::clone(&state.loopback_only);
     let engine_cache_arc = Arc::clone(&state.engine_cache);
     let latest_snap_arc = Arc::clone(&state.latest_snapshot);
 
     tauri::async_runtime::spawn_blocking(move || {
-        teardown_all_captures_blocking(&session_arc, &recorder_arc);
+        teardown_all_captures_blocking(&session_arc, &recorder_arc, &loopback_arc);
 
         let preset = get_tuning_preset(&config.tuning);
         let focus = InstrumentFocus::from_str_id(&config.focus);
         let stereo_mode = StereoMode::from_str_id(&config.stereo_mode);
         let enable_hpss = config.enable_hpss;
         let auto_level = config.auto_level;
+        let clef_override = ClefKind::from_str_id(&config.clef_mode);
         let region = NeckRegion::from_str_id(&config.neck_region);
         let solver_cfg = SolverConfig {
             region,
@@ -1075,10 +1282,10 @@ async fn start_transcription(
             let session_start = Instant::now();
             let mut dc_blocker = DcBlocker::new(active_sr as f32);
             let mut leveler = SignalLeveler::new(active_sr as f32);
-            let mut filter = InstrumentFilter::new(active_sr as f32, focus);
             let mut hpss = HpssSeparator::new(1.05);
 
             if mode == "poly" {
+                let mut filter = InstrumentFilter::new_for_poly(active_sr as f32, focus);
                 let _ = ready_tx.send(Ok((active_sr, fmt_label)));
 
                 let (win_tx, win_rx) = mpsc::sync_channel::<(Vec<f32>, u64)>(2);
@@ -1099,10 +1306,13 @@ async fn start_transcription(
                         cfg.enable_overtone_pruning = false;
                     }
                     if matches!(focus, InstrumentFocus::BowedStrings | InstrumentFocus::Vocals) {
-                        cfg.onset_threshold = 0.36;
-                        cfg.frame_threshold = 0.25;
+                        cfg.onset_threshold = 0.38;
+                        cfg.frame_threshold = 0.28;
                     }
-                    if !preset_infer.allow_bends {
+                    if matches!(focus, InstrumentFocus::Vocals | InstrumentFocus::Bass | InstrumentFocus::WindsBrass) {
+                        cfg.max_polyphony = 1;
+                    }
+                    if !preset_infer.allow_bends && tuning_id_infer != "auto" {
                         cfg.bend_min_cents = 999.0;
                     }
 
@@ -1123,7 +1333,9 @@ async fn start_transcription(
                         let infer_res = {
                             let mut guard = engine_infer.lock().unwrap();
                             match guard.as_mut() {
-                                Some(eng) => eng.transcribe_window(&window_22k, &cfg).map_err(|e| e.to_string()),
+                                Some(eng) => eng
+                                    .transcribe_window(&window_22k, &cfg)
+                                    .map_err(|e| e.to_string()),
                                 None => Err("Engine Basic Pitch indisponível.".to_string()),
                             }
                         };
@@ -1139,7 +1351,13 @@ async fn start_transcription(
                                 let mut changed = false;
                                 let mut latest_bend = 0.0f32;
 
-                                for ch in res.chords.into_iter().filter(|c| c.frame >= 86) {
+                                // Aceita exatamente a fatia central [43..129) de 86 frames:
+                                // casa 1:1 com o hop de 86 frames (zero duplicação, zero borda ruidosa)
+                                for ch in res
+                                    .chords
+                                    .into_iter()
+                                    .filter(|c| c.frame >= 43 && c.frame < 129)
+                                {
                                     let frames_before_end = 172usize.saturating_sub(ch.frame);
                                     let raw_start_ms = window_end_ms.saturating_sub(
                                         (frames_before_end as f64 * FRAME_DURATION_MS) as u64,
@@ -1150,14 +1368,14 @@ async fn start_transcription(
 
                                     if let Some(last) = timed_history.last() {
                                         if last.notes == ch.notes
-                                            && raw_start_ms.saturating_sub(last.start_ms) < 350
+                                            && raw_start_ms.saturating_sub(last.start_ms) < 180
                                         {
                                             continue;
                                         }
                                     }
 
                                     let start_ms = match timed_history.last() {
-                                        Some(last) => raw_start_ms.max(last.start_ms + 70),
+                                        Some(last) => raw_start_ms.max(last.start_ms + 55),
                                         None => raw_start_ms,
                                     };
 
@@ -1168,7 +1386,7 @@ async fn start_transcription(
                                     latest_bend = ch.max_bend_semitones;
                                     timed_history.push(TimedEvent {
                                         start_ms,
-                                        duration_ms: duration_ms.max(100),
+                                        duration_ms: duration_ms.max(90),
                                         notes: ch.notes,
                                         bend_semitones: ch.max_bend_semitones,
                                     });
@@ -1198,7 +1416,20 @@ async fn start_transcription(
                                         preset_infer.clone()
                                     };
 
-                                    let voicings = if active_preset.show_tab_staff {
+                                    let eff_clef = clef_override.unwrap_or_else(|| {
+                                        infer_optimal_clef(
+                                            &timed_history,
+                                            active_preset.show_tab_staff,
+                                            active_preset.clef,
+                                        )
+                                    });
+                                    let eff_show_tab = if eff_clef == ClefKind::GrandStaff {
+                                        false
+                                    } else {
+                                        active_preset.show_tab_staff
+                                    };
+
+                                    let voicings = if eff_show_tab {
                                         let raw_chords: Vec<Vec<u8>> =
                                             timed_history.iter().map(|e| e.notes.clone()).collect();
                                         solve_polyphonic_with_config(
@@ -1213,7 +1444,7 @@ async fn start_transcription(
                                     };
 
                                     let q_score = build_quantized_score(
-                                        "Tab Transcriber",
+                                        "",
                                         &timed_history,
                                         &voicings,
                                         &active_preset.midi_low_to_high,
@@ -1222,8 +1453,8 @@ async fn start_transcription(
                                     )
                                     .with_instrument(
                                         active_preset.midi_program,
-                                        active_preset.show_tab_staff,
-                                        active_preset.clef,
+                                        eff_show_tab,
+                                        eff_clef,
                                     );
 
                                     let detected_bpm = q_score.bpm;
@@ -1231,24 +1462,18 @@ async fn start_transcription(
                                     let latest_chord = latest_chord_label(&q_score);
                                     let key_obj = q_score.key;
 
-                                    let subtitle = format!(
-                                        "{} · {} — {} · {} · {} BPM",
-                                        detected_instrument,
-                                        active_preset.label,
-                                        detected_key,
-                                        time_sig.display_label(),
-                                        detected_bpm
-                                    );
                                     let alphatex = score_to_alphatex(
                                         &q_score,
                                         active_preset.alphatex_high_to_low,
-                                        &subtitle,
+                                        "",
                                     );
 
                                     *snap_infer.lock().unwrap() = Some(ScoreSnapshot {
                                         events: timed_history.clone(),
                                         voicings,
                                         tuning_id: tuning_id_infer.clone(),
+                                        clef: eff_clef,
+                                        show_tab_staff: eff_show_tab,
                                         time_sig,
                                         detected_instrument: detected_instrument.clone(),
                                         score: q_score,
@@ -1300,7 +1525,8 @@ async fn start_transcription(
                 let mut rolling_22k: VecDeque<f32> =
                     VecDeque::with_capacity(MODEL_WINDOW_SAMPLES + 2048);
 
-                let hop_22k = (MODEL_SAMPLE_RATE * 0.75) as usize;
+                // Hop exato de 86 frames (22.016 amostras) para casar 1:1 com o recorte central [43..129)
+                let hop_22k = 86 * FFT_HOP;
                 let mut samples_since_infer = 0usize;
                 let mut zero_chunks = 0u32;
                 let mut last_meter = Instant::now();
@@ -1311,7 +1537,7 @@ async fn start_transcription(
                         active_sr = live_sr;
                         dc_blocker = DcBlocker::new(active_sr as f32);
                         leveler = SignalLeveler::new(active_sr as f32);
-                        filter = InstrumentFilter::new(active_sr as f32, focus);
+                        filter = InstrumentFilter::new_for_poly(active_sr as f32, focus);
                         resampler = SincResampler::new(active_sr, MODEL_SAMPLE_RATE);
                     }
 
@@ -1398,6 +1624,7 @@ async fn start_transcription(
                 drop(win_tx);
                 let _ = infer_handle.join();
             } else {
+                let mut filter = InstrumentFilter::new(active_sr as f32, focus);
                 let _ = ready_tx.send(Ok((active_sr, fmt_label)));
 
                 let mut detector = YinDetector::new(active_sr as f32, YIN_WINDOW_SIZE);
@@ -1529,7 +1756,42 @@ async fn start_transcription(
                                 });
                                 warmth_history.push(event.timbral_warmth);
 
-                                let voicings: Vec<Option<ChordVoicing>> = if preset.show_tab_staff {
+                                let mut all_m: Vec<u8> = timed_history
+                                    .iter()
+                                    .filter_map(|e| e.notes.first().copied())
+                                    .collect();
+                                all_m.sort_unstable();
+                                let med_m = all_m.get(all_m.len() / 2).copied().unwrap_or(60) as f32;
+                                let mean_w = warmth_history.iter().sum::<f32>()
+                                    / (warmth_history.len().max(1) as f32);
+                                let detected_prof = detect_instrument_profile(
+                                    med_m,
+                                    1.0,
+                                    mean_w,
+                                    compute_percussiveness(&window),
+                                );
+                                let detected_instrument = detected_prof.label.to_string();
+
+                                let active_preset = if tuning_id == "auto" {
+                                    get_tuning_preset(detected_prof.preset_id)
+                                } else {
+                                    preset.clone()
+                                };
+
+                                let eff_clef = clef_override.unwrap_or_else(|| {
+                                    infer_optimal_clef(
+                                        &timed_history,
+                                        active_preset.show_tab_staff,
+                                        active_preset.clef,
+                                    )
+                                });
+                                let eff_show_tab = if eff_clef == ClefKind::GrandStaff {
+                                    false
+                                } else {
+                                    active_preset.show_tab_staff
+                                };
+
+                                let voicings: Vec<Option<ChordVoicing>> = if eff_show_tab {
                                     let midi_seq: Vec<u8> = timed_history
                                         .iter()
                                         .filter_map(|e| e.notes.first().copied())
@@ -1537,7 +1799,7 @@ async fn start_transcription(
                                     solve_tablature_with_config(
                                         &midi_seq,
                                         Some(&warmth_history),
-                                        &preset.midi_low_to_high,
+                                        &active_preset.midi_low_to_high,
                                         24,
                                         &solver_cfg,
                                     )
@@ -1549,49 +1811,35 @@ async fn start_transcription(
                                 };
 
                                 let q_score = build_quantized_score(
-                                    "Tab Transcriber",
+                                    "",
                                     &timed_history,
                                     &voicings,
-                                    &preset.midi_low_to_high,
+                                    &active_preset.midi_low_to_high,
                                     bpm_override,
                                     time_sig,
                                 )
-                                .with_instrument(preset.midi_program, preset.show_tab_staff, preset.clef);
-
-                                let mut all_m: Vec<u8> = timed_history
-                                    .iter()
-                                    .filter_map(|e| e.notes.first().copied())
-                                    .collect();
-                                all_m.sort_unstable();
-                                let med_m = all_m.get(all_m.len() / 2).copied().unwrap_or(60) as f32;
-                                let mean_w = warmth_history.iter().sum::<f32>()
-                                    / (warmth_history.len().max(1) as f32);
-                                let detected_instrument =
-                                    detect_instrument_profile(med_m, 1.0, mean_w, compute_percussiveness(&window)).label
-                                        .to_string();
+                                .with_instrument(
+                                    active_preset.midi_program,
+                                    eff_show_tab,
+                                    eff_clef,
+                                );
 
                                 let detected_bpm = q_score.bpm;
                                 let detected_key = q_score.key.display_name();
                                 let key_obj = q_score.key;
 
-                                let subtitle = format!(
-                                    "{} · {} — {} · {} · {} BPM",
-                                    detected_instrument,
-                                    preset.label,
-                                    detected_key,
-                                    time_sig.display_label(),
-                                    detected_bpm
-                                );
                                 let alphatex = score_to_alphatex(
                                     &q_score,
-                                    preset.alphatex_high_to_low,
-                                    &subtitle,
+                                    active_preset.alphatex_high_to_low,
+                                    "",
                                 );
 
                                 *latest_snap_arc.lock().unwrap() = Some(ScoreSnapshot {
                                     events: timed_history.clone(),
                                     voicings,
                                     tuning_id: tuning_id.clone(),
+                                    clef: eff_clef,
+                                    show_tab_staff: eff_show_tab,
                                     time_sig,
                                     detected_instrument: detected_instrument.clone(),
                                     score: q_score,
@@ -1655,17 +1903,366 @@ async fn start_transcription(
     .map_err(|e| format!("Falha ao iniciar transcrição ao vivo: {}", e))?
 }
 
+#[tauri::command]
+async fn pick_audio_file() -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        audio_import::pick_audio_file_macos()
+            .map(|opt| opt.map(|p| p.display().to_string()))
+    })
+    .await
+    .map_err(|e| format!("Falha ao abrir seletor de arquivos: {}", e))?
+}
+
+#[tauri::command]
+async fn separate_audio_file(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    file_path: String,
+    config: StemTranscribeConfig,
+) -> Result<StemSeparationResultDto, String> {
+    let session_arc = Arc::clone(&state.session);
+    let recorder_arc = Arc::clone(&state.snippet_recorder);
+    let loopback_arc = Arc::clone(&state.loopback_only);
+    let active_stems_arc = Arc::clone(&state.active_stems);
+    let latest_snap_arc = Arc::clone(&state.latest_snapshot);
+    let engine_cache_arc = Arc::clone(&state.engine_cache);
+
+    *state.active_tuning.lock().unwrap() = config.tuning.clone();
+    *state.active_time_signature.lock().unwrap() = TimeSignature::from_str_id(&config.time_signature);
+
+    let root_dir = workspace_root_dir();
+    let base_exports = exports_dir()?;
+    let app_clone = app.clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        teardown_all_captures_blocking(&session_arc, &recorder_arc, &loopback_arc);
+
+        let src_path = PathBuf::from(&file_path);
+        let file_label = src_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("audio")
+            .to_string();
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let session_dir = base_exports.join("stems").join(format!("file_{}", ts));
+        fs::create_dir_all(&session_dir)
+            .map_err(|e| format!("Falha ao criar pasta da sessão: {}", e))?;
+
+        let mix_wav = session_dir.join("mix.wav");
+        let _ = app_clone.emit(
+            "stem-status",
+            format!("Convertendo '{}' para WAV 24-bit…", file_label),
+        );
+        let conv_info = audio_import::prepare_mix_wav_24bit(&src_path, &mix_wav)?;
+
+        let _ = app_clone.emit(
+            "stem-status",
+            format!("Separando 6 stems ({} · {})…", file_label, conv_info),
+        );
+        let bundle = separate_with_htdemucs_6s(&mix_wav, &session_dir, &root_dir, &config.quality)?;
+        let _ = session_store::save_session_manifest(&bundle, &file_label, "file");
+
+        let target_stem = bundle.best_melodic_stem_or(&config.stem);
+        let stem_wav = bundle
+            .wav_for_stem(&target_stem)
+            .cloned()
+            .ok_or_else(|| format!("Stem '{}' não encontrado.", target_stem))?;
+
+        let available_stems = bundle.available_stems();
+        let stem_activities = bundle.activities.clone();
+        let engine_name = bundle.engine.clone();
+        let separation_ms = bundle.separation_ms;
+        let session_dir_str = bundle.session_dir.display().to_string();
+
+        *active_stems_arc.lock().unwrap() = Some(bundle);
+
+        let _ = app_clone.emit(
+            "stem-status",
+            format!("Transcrevendo stem '{}' de '{}'…", target_stem, file_label),
+        );
+
+        let mut cfg_eff = config;
+        cfg_eff.stem = target_stem.clone();
+        let params = build_offline_params(&cfg_eff, None);
+
+        let out = if cfg_eff.mode == "poly" {
+            ensure_engine_loaded(&engine_cache_arc)?;
+            let mut eng_guard = engine_cache_arc.lock().unwrap();
+            transcribe_stem_offline_with_engine(&stem_wav, &params, eng_guard.as_mut())?
+        } else {
+            transcribe_stem_offline_with_engine(&stem_wav, &params, None)?
+        };
+
+        let detected_key = out.score.key.display_name();
+        let detected_bpm = out.score.bpm;
+        let ts_label = out.score.time_signature.display_label();
+        let time_sig = out.score.time_signature;
+
+        let snap_events: Vec<TimedEvent> = out
+            .score
+            .measures
+            .iter()
+            .flat_map(|m| m.beats.iter())
+            .filter(|b| !b.is_rest() && !b.tie_from_prev)
+            .enumerate()
+            .map(|(idx, b)| TimedEvent {
+                start_ms: (idx as u64) * 250,
+                duration_ms: ((b.duration_ticks as u64) * 60_000) / ((detected_bpm as u64) * 4),
+                notes: b.midi_notes.clone(),
+                bend_semitones: b.bend_semitones,
+            })
+            .collect();
+        let snap_voicings: Vec<Option<ChordVoicing>> = out
+            .score
+            .measures
+            .iter()
+            .flat_map(|m| m.beats.iter())
+            .filter(|b| !b.is_rest() && !b.tie_from_prev)
+            .map(|b| b.voicing.clone())
+            .collect();
+
+        let effective_tuning = if cfg_eff.tuning == "auto" {
+            resolve_auto_stem_preset_id(&target_stem).to_string()
+        } else {
+            cfg_eff.tuning.clone()
+        };
+
+        let snap_clef = out.score.clef;
+        let snap_show_tab = out.score.show_tab_staff;
+        *latest_snap_arc.lock().unwrap() = Some(ScoreSnapshot {
+            events: snap_events,
+            voicings: snap_voicings,
+            tuning_id: effective_tuning,
+            time_sig,
+            detected_instrument: out.detected_instrument.clone(),
+            clef: snap_clef,
+            show_tab_staff: snap_show_tab,
+            score: out.score,
+        });
+
+        let _ = app_clone.emit(
+            "transcription-update",
+            TranscriptionUpdatePayload {
+                alphatex: out.alphatex,
+                latest_notes: out.latest_notes,
+                latest_chord: out.latest_chord,
+                detected_key,
+                detected_instrument: out.detected_instrument,
+                time_signature: ts_label,
+                event_count: out.event_count,
+                latency_ms: out.elapsed_ms,
+                detected_bpm,
+                estimated_a4_hz: out.estimated_a4_hz,
+                pruned_overtones: out.pruned_overtones,
+                bend_semitones: out.max_bend,
+                is_reattack: false,
+            },
+        );
+
+        Ok(StemSeparationResultDto {
+            engine: engine_name,
+            available_stems,
+            stem_activities,
+            active_stem: target_stem,
+            separation_ms,
+            transcription_ms: out.elapsed_ms,
+            event_count: out.event_count,
+            session_dir: session_dir_str,
+        })
+    })
+    .await
+    .map_err(|e| format!("Falha ao processar arquivo de áudio: {}", e))?
+}
+
+#[tauri::command]
+fn list_stem_sessions() -> Result<Vec<session_store::StoredStemSessionDto>, String> {
+    let base = exports_dir()?;
+    Ok(session_store::list_saved_sessions(&base))
+}
+
+#[tauri::command]
+fn load_user_preferences() -> Result<session_store::UserPreferences, String> {
+    let base = exports_dir()?;
+    Ok(session_store::load_preferences(&base))
+}
+
+#[tauri::command]
+fn save_user_preferences(prefs: session_store::UserPreferences) -> Result<(), String> {
+    let base = exports_dir()?;
+    session_store::save_preferences(&base, &prefs)
+}
+
+#[tauri::command]
+async fn load_stem_session(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    session_dir: String,
+    config: StemTranscribeConfig,
+) -> Result<StemSeparationResultDto, String> {
+    let session_arc = Arc::clone(&state.session);
+    let recorder_arc = Arc::clone(&state.snippet_recorder);
+    let loopback_arc = Arc::clone(&state.loopback_only);
+    let active_stems_arc = Arc::clone(&state.active_stems);
+    let latest_snap_arc = Arc::clone(&state.latest_snapshot);
+    let engine_cache_arc = Arc::clone(&state.engine_cache);
+
+    *state.active_tuning.lock().unwrap() = config.tuning.clone();
+    *state.active_time_signature.lock().unwrap() = TimeSignature::from_str_id(&config.time_signature);
+
+    let app_clone = app.clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        teardown_all_captures_blocking(&session_arc, &recorder_arc, &loopback_arc);
+
+        let dir_path = PathBuf::from(&session_dir);
+        let manifest = session_store::read_session_manifest(&dir_path);
+        let engine_hint = manifest.as_ref().map(|m| m.engine.as_str());
+        let cached_acts = manifest.as_ref().map(|m| m.activities.clone());
+
+        let _ = app_clone.emit("stem-status", "Carregando stems salvos do disco…");
+        let bundle = load_stem_bundle_from_dir(&dir_path, engine_hint, cached_acts)?;
+
+        let target_stem = bundle.best_melodic_stem_or(&config.stem);
+        let stem_wav = bundle
+            .wav_for_stem(&target_stem)
+            .cloned()
+            .ok_or_else(|| format!("Stem '{}' não encontrado na sessão.", target_stem))?;
+
+        let available_stems = bundle.available_stems();
+        let stem_activities = bundle.activities.clone();
+        let engine_name = bundle.engine.clone();
+        let session_dir_str = bundle.session_dir.display().to_string();
+
+        *active_stems_arc.lock().unwrap() = Some(bundle);
+
+        let _ = app_clone.emit(
+            "stem-status",
+            format!("Transcrevendo stem '{}' (sessão salva)…", target_stem),
+        );
+
+        let mut cfg_eff = config;
+        cfg_eff.stem = target_stem.clone();
+        let params = build_offline_params(&cfg_eff, None);
+
+        let out = if cfg_eff.mode == "poly" {
+            ensure_engine_loaded(&engine_cache_arc)?;
+            let mut eng_guard = engine_cache_arc.lock().unwrap();
+            transcribe_stem_offline_with_engine(&stem_wav, &params, eng_guard.as_mut())?
+        } else {
+            transcribe_stem_offline_with_engine(&stem_wav, &params, None)?
+        };
+
+        let detected_key = out.score.key.display_name();
+        let detected_bpm = out.score.bpm;
+        let ts_label = out.score.time_signature.display_label();
+        let time_sig = out.score.time_signature;
+
+        let snap_events: Vec<TimedEvent> = out
+            .score
+            .measures
+            .iter()
+            .flat_map(|m| m.beats.iter())
+            .filter(|b| !b.is_rest() && !b.tie_from_prev)
+            .enumerate()
+            .map(|(idx, b)| TimedEvent {
+                start_ms: (idx as u64) * 250,
+                duration_ms: ((b.duration_ticks as u64) * 60_000) / ((detected_bpm as u64) * 4),
+                notes: b.midi_notes.clone(),
+                bend_semitones: b.bend_semitones,
+            })
+            .collect();
+        let snap_voicings: Vec<Option<ChordVoicing>> = out
+            .score
+            .measures
+            .iter()
+            .flat_map(|m| m.beats.iter())
+            .filter(|b| !b.is_rest() && !b.tie_from_prev)
+            .map(|b| b.voicing.clone())
+            .collect();
+
+        let effective_tuning = if cfg_eff.tuning == "auto" {
+            resolve_auto_stem_preset_id(&target_stem).to_string()
+        } else {
+            cfg_eff.tuning.clone()
+        };
+
+        let snap_clef = out.score.clef;
+        let snap_show_tab = out.score.show_tab_staff;
+        let _ = (snap_clef, snap_show_tab);
+        *latest_snap_arc.lock().unwrap() = Some(ScoreSnapshot {
+            events: snap_events,
+            voicings: snap_voicings,
+            tuning_id: effective_tuning,
+            time_sig,
+            detected_instrument: out.detected_instrument.clone(),
+            clef: snap_clef,
+            show_tab_staff: snap_show_tab,
+            score: out.score,
+        });
+
+        let _ = app_clone.emit(
+            "transcription-update",
+            TranscriptionUpdatePayload {
+                alphatex: out.alphatex,
+                latest_notes: out.latest_notes,
+                latest_chord: out.latest_chord,
+                detected_key,
+                detected_instrument: out.detected_instrument,
+                time_signature: ts_label,
+                event_count: out.event_count,
+                latency_ms: out.elapsed_ms,
+                detected_bpm,
+                estimated_a4_hz: out.estimated_a4_hz,
+                pruned_overtones: out.pruned_overtones,
+                bend_semitones: out.max_bend,
+                is_reattack: false,
+            },
+        );
+
+        Ok(StemSeparationResultDto {
+            engine: engine_name,
+            available_stems,
+            stem_activities,
+            active_stem: target_stem,
+            separation_ms: 0,
+            transcription_ms: out.elapsed_ms,
+            event_count: out.event_count,
+            session_dir: session_dir_str,
+        })
+    })
+    .await
+    .map_err(|e| format!("Falha ao reabrir sessão de stems: {}", e))?
+}
+
+#[tauri::command]
+fn get_runtime_diagnostics() -> resources::RuntimeDiagnosticsDto {
+    resources::collect_diagnostics()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .setup(|app| {
+            if let Ok(dir) = app.path().resource_dir() {
+                resources::register_resource_dir(dir);
+            }
+            Ok(())
+        })
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
+            check_neural_backend,
             check_stems_backend,
             load_stem_audio,
             list_audio_sources,
             get_initial_tex,
             start_transcription,
             stop_transcription,
+            start_loopback_only,
+            stop_loopback_only,
             cancel_snippet_recording,
             clear_transcription,
             rescale_score_bpm,
@@ -1674,6 +2271,13 @@ pub fn run() {
             start_snippet_recording,
             stop_and_separate_snippet,
             transcribe_existing_stem,
+            pick_audio_file,
+            separate_audio_file,
+            list_stem_sessions,
+            load_stem_session,
+            load_user_preferences,
+            save_user_preferences,
+            get_runtime_diagnostics,
         ])
         .run(tauri::generate_context!())
         .expect("erro ao executar aplicação Tauri");

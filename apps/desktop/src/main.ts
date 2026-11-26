@@ -12,6 +12,14 @@ interface AudioSourceDto {
   is_running_output: boolean;
 }
 
+interface NeuralBackendStatus {
+  muscriptor_ready: boolean;
+  beat_this_ready: boolean;
+  mps_available: boolean;
+  device: string;
+  hint: string;
+}
+
 interface BackendStatus {
   ready: boolean;
   engine: string;
@@ -23,6 +31,33 @@ interface StemActivity {
   label: string;
   rms_db: number;
   active: boolean;
+}
+
+interface StoredStemSessionDto {
+  id: string;
+  label: string;
+  created_at: number;
+  session_dir: string;
+  engine: string;
+  active_stems: string[];
+}
+
+interface UserPreferences {
+  mode: string;
+  stereo_mode: string;
+  auto_level: boolean;
+  enable_hpss: boolean;
+  focus: string;
+  tuning: string;
+  neck_region: string;
+  prefer_closed: boolean;
+  time_signature: string;
+  bpm: string;
+  view: string;
+  stem_quality: string;
+  stem: string;
+  playback_speed: number;
+  metronome_enabled: boolean;
 }
 
 interface StemSeparationResultDto {
@@ -109,8 +144,11 @@ const scoreContainer = document.getElementById('alphaTab') as HTMLDivElement;
 
 const recordStemBtn = document.getElementById('record-stem-btn') as HTMLButtonElement;
 const cancelStemBtn = document.getElementById('cancel-stem-btn') as HTMLButtonElement;
+const importAudioBtn = document.getElementById('import-audio-btn') as HTMLButtonElement;
 const recTimerEl = document.getElementById('rec-timer') as HTMLSpanElement;
+const savedSessionsSelect = document.getElementById('saved-sessions-select') as HTMLSelectElement;
 const stemQualitySelect = document.getElementById('stem-quality-select') as HTMLSelectElement;
+const neuralEngineSelect = document.getElementById('neural-engine-select') as HTMLSelectElement;
 const stemSelect = document.getElementById('stem-select') as HTMLSelectElement;
 const retranscribeStemBtn = document.getElementById('retranscribe-stem-btn') as HTMLButtonElement;
 const stemPlayBtn = document.getElementById('stem-play-btn') as HTMLButtonElement;
@@ -142,6 +180,9 @@ const stemBlobCache = new Map<string, string>();
 let stemAudioListenMix = false;
 let loadedAudioStemKey: string | null = null;
 let isScrubbingStem = false;
+let desiredMetronomeEnabled = false;
+let desiredPlaybackSpeed = 1.0;
+let savePrefsTimer: number | null = null;
 
 const api = new alphaTab.AlphaTabApi(scoreContainer, {
   core: {
@@ -218,6 +259,9 @@ function syncUiControls() {
       : '● Gravar Trecho';
   recordStemBtn.classList.toggle('recording', isRecordingSnippet);
   recordStemBtn.disabled = isSeparating || isTransitioning;
+  importAudioBtn.disabled = isSeparating || isTransitioning || isRecordingSnippet;
+  savedSessionsSelect.disabled = isSeparating || isTransitioning || isRecordingSnippet;
+  neuralEngineSelect.disabled = isSeparating || isTransitioning;
 
   cancelStemBtn.classList.toggle('hidden', !isRecordingSnippet);
   cancelStemBtn.disabled = isSeparating || isTransitioning;
@@ -275,6 +319,27 @@ function updateStemSelectWithActivities(activities: StemActivity[]) {
 
 
 const NON_FRETTED_PRESETS = new Set(['piano', 'vocals', 'strings', 'cello', 'winds', 'synth']);
+
+function syncStaveProfileFromTex(tex: string) {
+  const isScoreOnly = tex.includes('\\staff {score}') && !tex.includes('\\staff {score tabs}');
+  if (isScoreOnly) {
+    if (api.settings.display.staveProfile !== alphaTab.StaveProfile.Score) {
+      api.settings.display.staveProfile = alphaTab.StaveProfile.Score;
+      api.updateSettings();
+    }
+  } else {
+    const desired =
+      viewSelect.value === 'tab'
+        ? alphaTab.StaveProfile.Tab
+        : viewSelect.value === 'score'
+          ? alphaTab.StaveProfile.Score
+          : alphaTab.StaveProfile.ScoreTab;
+    if (api.settings.display.staveProfile !== desired) {
+      api.settings.display.staveProfile = desired;
+      api.updateSettings();
+    }
+  }
+}
 
 function syncInstrumentAdaptiveUi() {
   const isFretted = !NON_FRETTED_PRESETS.has(tuningSelect.value);
@@ -451,6 +516,7 @@ function buildStemTranscribeConfig() {
     neck_region: regionSelect.value,
     prefer_closed: closedSelect.value === 'closed',
     quality: stemQualitySelect.value,
+    neural_engine: neuralEngineSelect.value,
   };
 }
 
@@ -466,6 +532,9 @@ api.playerReady.on(() => {
   setPlayerControlsEnabled(true);
   sfStatus.textContent = 'SoundFont local pronto · Clique para navegar / Arraste para loop';
   sfStatus.classList.add('ready');
+  api.playbackSpeed = desiredPlaybackSpeed;
+  api.metronomeVolume = desiredMetronomeEnabled ? 0.6 : 0;
+  metronomeBtn.classList.toggle('toggle-active', desiredMetronomeEnabled);
 });
 
 api.playerStateChanged.on((e) => {
@@ -518,11 +587,15 @@ loopBtn.addEventListener('click', () => {
 metronomeBtn.addEventListener('click', () => {
   const nextActive = api.metronomeVolume === 0;
   api.metronomeVolume = nextActive ? 0.6 : 0;
+  desiredMetronomeEnabled = nextActive;
   metronomeBtn.classList.toggle('toggle-active', nextActive);
+  scheduleSavePreferences();
 });
 
 speedSelect.addEventListener('change', () => {
-  api.playbackSpeed = Number(speedSelect.value);
+  desiredPlaybackSpeed = Number(speedSelect.value);
+  api.playbackSpeed = desiredPlaybackSpeed;
+  scheduleSavePreferences();
 });
 
 window.addEventListener('keydown', (e) => {
@@ -541,7 +614,8 @@ async function renderEmptyScore() {
     timeSignature: tsSelect.value,
   });
   bpmLabel.textContent = `100 BPM · ${tsSelect.value}`;
-  api.tex(tex);
+  syncStaveProfileFromTex(tex);
+      api.tex(tex);
 }
 
 async function refreshAudioSources() {
@@ -578,16 +652,23 @@ async function refreshAudioSources() {
 
 async function checkStemsAvailability() {
   try {
-    const st = await invoke<BackendStatus>('check_stems_backend');
+    const [st, neural] = await Promise.all([
+      invoke<BackendStatus>('check_stems_backend'),
+      invoke<NeuralBackendStatus>('check_neural_backend'),
+    ]);
+    const neuralTag =
+      neural.muscriptor_ready || neural.beat_this_ready
+        ? ` · ${neural.hint}`
+        : ' · Neural offline: Basic Pitch';
     if (st.ready) {
-      stemsStatusEl.textContent = `HTDemucs 6s pronto (${st.engine})`;
+      stemsStatusEl.textContent = `HTDemucs 6s (${st.engine})${neuralTag}`;
       stemsStatusEl.classList.add('ready');
     } else {
-      stemsStatusEl.textContent = `HTDemucs: ${st.hint}`;
+      stemsStatusEl.textContent = `HTDemucs: ${st.hint}${neuralTag}`;
       stemsStatusEl.classList.remove('ready');
     }
   } catch (err) {
-    stemsStatusEl.textContent = `Erro ao verificar stems: ${String(err)}`;
+    stemsStatusEl.textContent = `Erro ao verificar backends: ${String(err)}`;
   }
 }
 
@@ -709,12 +790,67 @@ recordStemBtn.addEventListener('click', async () => {
     const activeCount = res.stem_activities.filter((a) => a.active).length;
     const sepSec = (res.separation_ms / 1000).toFixed(1);
     stemsStatusEl.textContent = `${activeCount}/6 stems ativos (${res.engine}) em ${sepSec}s · ativo: ${res.active_stem}`;
+    void refreshSavedSessions(res.session_dir);
     stemsStatusEl.classList.add('ready');
     statusText.textContent = `Stem '${res.active_stem}': ${res.event_count} eventos (${res.transcription_ms} ms)`;
   } catch (err) {
     stemsStatusEl.textContent = `Falha: ${String(err)}`;
     stemsStatusEl.classList.remove('ready');
     statusText.textContent = `Erro HTDemucs: ${String(err)}`;
+  } finally {
+    isSeparating = false;
+    syncUiControls();
+  }
+});
+
+importAudioBtn.addEventListener('click', async () => {
+  if (isSeparating || isTransitioning || isRecordingSnippet) return;
+
+  isTransitioning = true;
+  syncUiControls();
+
+  let pickedPath: string | null = null;
+  try {
+    pickedPath = await invoke<string | null>('pick_audio_file');
+  } catch (err) {
+    statusText.textContent = `Erro ao selecionar arquivo: ${String(err)}`;
+  } finally {
+    isTransitioning = false;
+    syncUiControls();
+  }
+
+  if (!pickedPath) return;
+
+  if (isPlayerReady) api.stop();
+  clearStemAudioCache();
+  setStemAudioControlsEnabled(false);
+  isRunning = false;
+  isSeparating = true;
+  syncUiControls();
+
+  try {
+    const res = await invoke<StemSeparationResultDto>('separate_audio_file', {
+      filePath: pickedPath,
+      config: buildStemTranscribeConfig(),
+    });
+    hasSeparatedStems = true;
+    updateStemSelectWithActivities(res.stem_activities);
+    stemSelect.value = res.active_stem;
+    setStemAudioControlsEnabled(true);
+
+    await loadStemIntoAudioElement(res.active_stem, false);
+
+    const fileName = pickedPath.split('/').pop() ?? pickedPath;
+    const activeCount = res.stem_activities.filter((a) => a.active).length;
+    const sepSec = (res.separation_ms / 1000).toFixed(1);
+    stemsStatusEl.textContent = `${fileName} · ${activeCount}/6 stems (${res.engine}) em ${sepSec}s`;
+    void refreshSavedSessions(res.session_dir);
+    stemsStatusEl.classList.add('ready');
+    statusText.textContent = `Stem '${res.active_stem}': ${res.event_count} eventos (${res.transcription_ms} ms)`;
+  } catch (err) {
+    stemsStatusEl.textContent = `Falha: ${String(err)}`;
+    stemsStatusEl.classList.remove('ready');
+    statusText.textContent = `Erro ao importar áudio: ${String(err)}`;
   } finally {
     isSeparating = false;
     syncUiControls();
@@ -862,6 +998,162 @@ viewSelect.addEventListener('change', () => {
   api.render();
 });
 
+function setSelectValueIfValid(sel: HTMLSelectElement, val: string) {
+  if (Array.from(sel.options).some((o) => o.value === val)) {
+    sel.value = val;
+  }
+}
+
+function collectCurrentPreferences(): UserPreferences {
+  return {
+    mode: modeSelect.value,
+    stereo_mode: stereoSelect.value,
+    auto_level: autolevelSelect.value === 'on',
+    enable_hpss: hpssSelect.value === 'on',
+    focus: focusSelect.value,
+    tuning: tuningSelect.value,
+    neck_region: regionSelect.value,
+    prefer_closed: closedSelect.value === 'closed',
+    time_signature: tsSelect.value,
+    bpm: bpmSelect.value,
+    view: viewSelect.value,
+    stem_quality: stemQualitySelect.value,
+    stem: stemSelect.value,
+    playback_speed: desiredPlaybackSpeed,
+    metronome_enabled: desiredMetronomeEnabled,
+  };
+}
+
+function scheduleSavePreferences() {
+  if (savePrefsTimer !== null) {
+    window.clearTimeout(savePrefsTimer);
+  }
+  savePrefsTimer = window.setTimeout(() => {
+    savePrefsTimer = null;
+    void invoke('save_user_preferences', { prefs: collectCurrentPreferences() }).catch(() => {});
+  }, 250);
+}
+
+async function restoreUserPreferences() {
+  try {
+    const prefs = await invoke<UserPreferences>('load_user_preferences');
+    setSelectValueIfValid(modeSelect, prefs.mode);
+    setSelectValueIfValid(stereoSelect, prefs.stereo_mode);
+    autolevelSelect.value = prefs.auto_level ? 'on' : 'off';
+    hpssSelect.value = prefs.enable_hpss ? 'on' : 'off';
+    setSelectValueIfValid(focusSelect, prefs.focus);
+    setSelectValueIfValid(tuningSelect, prefs.tuning);
+    setSelectValueIfValid(regionSelect, prefs.neck_region);
+    closedSelect.value = prefs.prefer_closed ? 'closed' : 'auto';
+    setSelectValueIfValid(tsSelect, prefs.time_signature);
+    setSelectValueIfValid(bpmSelect, prefs.bpm);
+    setSelectValueIfValid(viewSelect, prefs.view);
+    setSelectValueIfValid(stemQualitySelect, prefs.stem_quality);
+    setSelectValueIfValid(stemSelect, prefs.stem);
+    setSelectValueIfValid(speedSelect, String(prefs.playback_speed));
+
+    desiredPlaybackSpeed = Number(speedSelect.value) || 1.0;
+    desiredMetronomeEnabled = Boolean(prefs.metronome_enabled);
+
+    syncInstrumentAdaptiveUi();
+
+    const profileMap: Record<string, alphaTab.StaveProfile> = {
+      scoretab: alphaTab.StaveProfile.ScoreTab,
+      tab: alphaTab.StaveProfile.Tab,
+      score: alphaTab.StaveProfile.Score,
+    };
+    if (profileMap[viewSelect.value] !== undefined) {
+      api.settings.display.staveProfile = profileMap[viewSelect.value];
+      api.updateSettings();
+    }
+  } catch {
+    // Mantém padrões na primeira execução
+  }
+}
+
+async function refreshSavedSessions(selectedDir?: string) {
+  try {
+    const sessions = await invoke<StoredStemSessionDto[]>('list_stem_sessions');
+    const prev = selectedDir ?? savedSessionsSelect.value;
+    savedSessionsSelect.innerHTML = '';
+
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent =
+      sessions.length > 0 ? `Sessões Salvas (${sessions.length})` : 'Nenhuma sessão salva';
+    savedSessionsSelect.appendChild(placeholder);
+
+    for (const s of sessions) {
+      const opt = document.createElement('option');
+      opt.value = s.session_dir;
+      const stemsHint = s.active_stems.length > 0 ? ` · ${s.active_stems.join('/')}` : '';
+      opt.textContent = `${s.label}${stemsHint}`;
+      savedSessionsSelect.appendChild(opt);
+    }
+
+    if (prev && Array.from(savedSessionsSelect.options).some((o) => o.value === prev)) {
+      savedSessionsSelect.value = prev;
+    }
+  } catch {
+    // Ignora se a pasta ainda não existe
+  }
+}
+
+savedSessionsSelect.addEventListener('change', async () => {
+  const sessionDir = savedSessionsSelect.value;
+  if (!sessionDir || isSeparating || isTransitioning || isRecordingSnippet) return;
+
+  if (isPlayerReady) api.stop();
+  clearStemAudioCache();
+  setStemAudioControlsEnabled(false);
+  isRunning = false;
+  isSeparating = true;
+  syncUiControls();
+
+  try {
+    const res = await invoke<StemSeparationResultDto>('load_stem_session', {
+      sessionDir,
+      config: buildStemTranscribeConfig(),
+    });
+    hasSeparatedStems = true;
+    updateStemSelectWithActivities(res.stem_activities);
+    stemSelect.value = res.active_stem;
+    setStemAudioControlsEnabled(true);
+
+    await loadStemIntoAudioElement(res.active_stem, false);
+
+    const activeCount = res.stem_activities.filter((a) => a.active).length;
+    stemsStatusEl.textContent = `Sessão reaberta · ${activeCount}/6 stems (${res.engine})`;
+    stemsStatusEl.classList.add('ready');
+    statusText.textContent = `Stem '${res.active_stem}': ${res.event_count} eventos (${res.transcription_ms} ms)`;
+  } catch (err) {
+    stemsStatusEl.textContent = `Erro ao reabrir: ${String(err)}`;
+    stemsStatusEl.classList.remove('ready');
+    statusText.textContent = `Erro ao carregar sessão: ${String(err)}`;
+  } finally {
+    isSeparating = false;
+    syncUiControls();
+  }
+});
+
+for (const el of [
+  modeSelect,
+  stereoSelect,
+  autolevelSelect,
+  hpssSelect,
+  focusSelect,
+  tuningSelect,
+  regionSelect,
+  closedSelect,
+  tsSelect,
+  bpmSelect,
+  viewSelect,
+  stemQualitySelect,
+  stemSelect,
+]) {
+  el.addEventListener('change', scheduleSavePreferences);
+}
+
 async function bootstrap() {
   await listen<TranscriptionUpdatePayload>('transcription-update', (event) => {
     const {
@@ -880,7 +1172,8 @@ async function bootstrap() {
       is_reattack,
     } = event.payload;
 
-    api.tex(alphatex);
+    syncStaveProfileFromTex(alphatex);
+      api.tex(alphatex);
 
     let noteDisplay = latest_notes.length > 0 ? latest_notes.join(' + ') : '—';
     if (bend_semitones >= 0.45) {
@@ -947,9 +1240,10 @@ async function bootstrap() {
     statusText.textContent = `Erro no motor: ${event.payload}`;
   });
 
+  await restoreUserPreferences();
   syncInstrumentAdaptiveUi();
   syncUiControls();
-  await Promise.all([refreshAudioSources(), checkStemsAvailability(), renderEmptyScore()]);
+  await Promise.all([refreshAudioSources(), checkStemsAvailability(), refreshSavedSessions(), renderEmptyScore()]);
 }
 
 void bootstrap();

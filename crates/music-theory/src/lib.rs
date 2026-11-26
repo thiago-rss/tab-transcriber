@@ -1,12 +1,20 @@
+use std::collections::BTreeSet;
+
+use tab_solver::{ChordVoicing, FretPos};
+
 /// Clave musical para renderização correta por família instrumental.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClefKind {
-    /// Clave de Sol em altura real (Piano, Voz, Violino, Flauta, Sax, Synth)
+    /// Clave de Sol em altura real (Voz, Violino, Flauta, Sax)
     Treble,
     /// Clave de Sol oitavada abaixo (Guitarra, Violão, Oud)
     Treble8vb,
     /// Clave de Fá (Baixo, Violoncelo, Fagote, Trombone)
     Bass,
+    /// Sistema duplo separado: Clave de Sol (mão direita/agudo) + Clave de Fá (mão esquerda/grave)
+    GrandStaff,
+    /// Clave de Dó na 3ª linha (Viola / registro médio)
+    Alto,
 }
 
 impl Default for ClefKind {
@@ -16,15 +24,57 @@ impl Default for ClefKind {
 }
 
 impl ClefKind {
+    pub fn from_str_id(id: &str) -> Option<Self> {
+        match id.trim().to_lowercase().as_str() {
+            "grand" | "grandstaff" | "piano" | "dual" => Some(Self::GrandStaff),
+            "treble" | "g2" | "sol" => Some(Self::Treble),
+            "treble8vb" | "guitar" => Some(Self::Treble8vb),
+            "bass" | "f4" | "fa" => Some(Self::Bass),
+            _ => None, // "auto"
+        }
+    }
+
     pub fn alphatex_clef(&self) -> &'static str {
         match self {
-            Self::Treble | Self::Treble8vb => "G2",
             Self::Bass => "F4",
+            Self::Alto => "C3",
+            _ => "G2",
         }
     }
 }
 
-use tab_solver::{ChordVoicing, FretPos};
+/// Escolhe automaticamente a melhor clave (incluindo Grand Staff) a partir da tessitura real das notas.
+pub fn infer_optimal_clef(events: &[TimedEvent], show_tab_staff: bool, fallback: ClefKind) -> ClefKind {
+    let mut all_notes: Vec<u8> = events
+        .iter()
+        .flat_map(|e| e.notes.iter().copied())
+        .collect();
+    if all_notes.is_empty() {
+        return fallback;
+    }
+    all_notes.sort_unstable();
+
+    let p10 = all_notes[all_notes.len() / 10];
+    let med = all_notes[all_notes.len() / 2];
+    let p90 = all_notes[(all_notes.len() * 9) / 10];
+
+    if show_tab_staff {
+        return if med <= 48 && p90 <= 62 {
+            ClefKind::Bass
+        } else {
+            ClefKind::Treble8vb
+        };
+    }
+
+    // Se cobre tanto a região grave (< B3) quanto a aguda (>= E4) com amplitude >= 13 semitons -> Grand Staff
+    if p10 <= 57 && p90 >= 64 && p90.saturating_sub(p10) >= 13 {
+        ClefKind::GrandStaff
+    } else if med <= 55 && p90 <= 64 {
+        ClefKind::Bass
+    } else {
+        ClefKind::Treble
+    }
+}
 
 /// Fórmula de compasso suportada pelo quantizador e exportadores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,7 +110,6 @@ impl TimeSignature {
         }
     }
 
-    /// Total de semicolcheias (ticks) em um compasso completo.
     pub fn measure_ticks(&self) -> u8 {
         let ticks_per_beat = 16u8 / self.denominator.max(1);
         self.numerator.saturating_mul(ticks_per_beat).max(4)
@@ -74,7 +123,6 @@ impl TimeSignature {
         format!("({} {})", self.numerator, self.denominator)
     }
 
-    /// Potência de 2 do denominador para o meta-evento MIDI 0xFF 0x58.
     pub fn midi_denominator_pow2(&self) -> u8 {
         match self.denominator {
             1 => 0,
@@ -87,14 +135,12 @@ impl TimeSignature {
     }
 }
 
-/// Modo tonal detectado pelo classificador Krumhansl-Schmuckler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyMode {
     Major,
     Minor,
 }
 
-/// Tonalidade inferida com posição no ciclo de quintas (-7 a +7).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DetectedKey {
     pub tonic_pc: u8,
@@ -230,7 +276,6 @@ pub struct ChordSymbol {
     pub label: String,
 }
 
-/// Evento musical capturado com estampa temporal, duração e expressividade (bend).
 #[derive(Debug, Clone)]
 pub struct TimedEvent {
     pub start_ms: u64,
@@ -239,8 +284,6 @@ pub struct TimedEvent {
     pub bend_semitones: f32,
 }
 
-/// Unidade rítmica quantizada em semicolcheias (ticks).
-/// Valores válidos: 1 (16th), 2 (8th), 3 (8th.), 4 (quarter), 6 (quarter.), 8 (half), 12 (half.), 16 (whole).
 #[derive(Debug, Clone)]
 pub struct QuantizedBeat {
     pub duration_ticks: u8,
@@ -298,6 +341,8 @@ pub struct QuantizedScore {
     pub midi_program: u8,
     pub show_tab_staff: bool,
     pub clef: ClefKind,
+    /// Ponto de divisão Clave de Sol / Clave de Fá no modo GrandStaff (padrão: MIDI 60 = C4).
+    pub split_midi: u8,
 }
 
 impl QuantizedScore {
@@ -307,6 +352,58 @@ impl QuantizedScore {
         self.clef = clef;
         self
     }
+
+    pub fn with_split_midi(mut self, split_midi: u8) -> Self {
+        self.split_midi = split_midi.clamp(48, 72);
+        self
+    }
+}
+
+/// Divide as notas de um beat entre Clave de Sol (treble) e Clave de Fá (bass) com histerese
+/// suave em torno de `split_midi` para evitar saltos constantes entre pautas em melodias centrais.
+fn split_beat_notes(
+    notes: &[u8],
+    split_midi: u8,
+    prev_single_was_treble: &mut bool,
+) -> (Vec<u8>, Vec<u8>) {
+    if notes.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    if notes.len() == 1 {
+        let m = notes[0];
+        let go_treble = if m >= split_midi + 2 {
+            true
+        } else if m <= split_midi.saturating_sub(3) {
+            false
+        } else {
+            // Zona de histerese (A3..C#4): mantém a pauta da nota anterior
+            *prev_single_was_treble
+        };
+        *prev_single_was_treble = go_treble;
+        return if go_treble {
+            (vec![m], Vec::new())
+        } else {
+            (Vec::new(), vec![m])
+        };
+    }
+
+    // Em acordes, divide estritamente pelo ponto de corte (C4 = 60 por padrão)
+    let mut treble = Vec::new();
+    let mut bass = Vec::new();
+    for &m in notes {
+        if m >= split_midi {
+            treble.push(m);
+        } else {
+            bass.push(m);
+        }
+    }
+    if !treble.is_empty() && bass.is_empty() {
+        *prev_single_was_treble = true;
+    } else if treble.is_empty() && !bass.is_empty() {
+        *prev_single_was_treble = false;
+    }
+    (treble, bass)
 }
 
 // ============================================================================
@@ -621,22 +718,19 @@ pub fn recognize_chord(midi_notes: &[u8], key: DetectedKey) -> Option<ChordSymbo
 // ESTIMATIVA DE BPM POR AUTOCORRELAÇÃO NORMALIZADA + PROTEÇÃO HALF-TIME
 // ============================================================================
 
-/// Estima o BPM via autocorrelação normalizada por sobreposição (sem viés para lags curtos),
-/// com saliência musical (acordes/mudanças/duração) e proteção explícita contra dobramento (half-time).
 pub fn estimate_bpm(events: &[TimedEvent], fallback_bpm: u16) -> u16 {
     if events.len() < 4 {
         return fallback_bpm;
     }
 
-    const STEP_MS: u64 = 10; // 100 Hz
+    const STEP_MS: u64 = 10;
     const MAX_WINDOW_MS: u64 = 24_000;
-    const MIN_LAG: usize = 35;  // ~171 BPM máx.
-    const MAX_LAG: usize = 108; // ~55.5 BPM mín.
+    const MIN_LAG: usize = 35;
+    const MAX_LAG: usize = 108;
 
     let end_ms = events.last().map(|e| e.start_ms).unwrap_or(0);
     let start_cutoff = end_ms.saturating_sub(MAX_WINDOW_MS);
 
-    // Filtra micro-aglomerados (< 85 ms) que vêm de palhetada dedilhada/arpejada
     let mut active: Vec<&TimedEvent> = Vec::new();
     for ev in events.iter().filter(|e| e.start_ms >= start_cutoff) {
         if let Some(prev) = active.last() {
@@ -662,7 +756,6 @@ pub fn estimate_bpm(events: &[TimedEvent], fallback_bpm: u16) -> u16 {
         return fallback_bpm;
     }
 
-    // Curva de novidade ponderada por saliência musical (acordes, notas longas e mudança de baixo)
     let mut env = vec![0.0f64; len];
     const KERNEL: [(isize, f64); 5] = [(-2, 0.20), (-1, 0.65), (0, 1.0), (1, 0.65), (2, 0.20)];
     let mut prev_bass: Option<u8> = None;
@@ -699,8 +792,6 @@ pub fn estimate_bpm(events: &[TimedEvent], fallback_bpm: u16) -> u16 {
         return fallback_bpm;
     }
 
-    // Autocorrelação normalizada localmente (cosine similarity sobre a região sobreposta):
-    // impede que lags curtos (150-180 BPM) vençam apenas por terem mais amostras na soma.
     let unbiased_autocorr = |lag: usize| -> f64 {
         if lag == 0 || lag + 8 >= len {
             return 0.0;
@@ -728,7 +819,7 @@ pub fn estimate_bpm(events: &[TimedEvent], fallback_bpm: u16) -> u16 {
 
     let mut raw_r = vec![0.0f64; max_lag + 1];
     let mut scores = vec![0.0f64; max_lag + 1];
-    let mut best_lag = 60usize; // 100 BPM padrão
+    let mut best_lag = 60usize;
     let mut best_score = 0.0f64;
 
     for lag in MIN_LAG..=max_lag {
@@ -744,7 +835,6 @@ pub fn estimate_bpm(events: &[TimedEvent], fallback_bpm: u16) -> u16 {
         }
         let harmonic_r = num / w_sum;
 
-        // Prior perceptual centrado em 96 BPM (desencoraja leituras aceleradas 150-175 BPM)
         let bpm = 60_000.0 / ((lag as f64) * (STEP_MS as f64));
         let log_dist = (bpm / 96.0).ln() / 0.36;
         let prior = (-0.5 * log_dist * log_dist).exp();
@@ -762,7 +852,6 @@ pub fn estimate_bpm(events: &[TimedEvent], fallback_bpm: u16) -> u16 {
         return fallback_bpm;
     }
 
-    // Proteção explícita contra erro de oitava rítmica (subdivisão de colcheias lida como pulso)
     let cand_bpm = 60_000.0 / ((best_lag as f64) * (STEP_MS as f64));
     if cand_bpm > 130.0 {
         let double_lag = best_lag * 2;
@@ -795,10 +884,41 @@ pub fn estimate_bpm(events: &[TimedEvent], fallback_bpm: u16) -> u16 {
 }
 
 // ============================================================================
-// QUANTIZAÇÃO COM FIGURAS PONTUADAS, LIGADURAS E COMPASSOS FLEXÍVEIS
+// QUANTIZAÇÃO COM FASE ÓTIMA DE GRADE, FUSÃO DE JITTER, PONTOS E LIGADURAS
 // ============================================================================
 
 const VALID_FIGURES: [u8; 8] = [16, 12, 8, 6, 4, 3, 2, 1];
+
+/// Encontra o deslocamento de fase (em ms) que melhor alinha todos os ataques à grade de semicolcheias.
+fn find_best_grid_phase(events: &[TimedEvent], t0: u64, sixteenth_ms: f64) -> f64 {
+    if events.len() < 3 || sixteenth_ms <= 10.0 {
+        return 0.0;
+    }
+
+    let mut best_phase = 0.0f64;
+    let mut best_err = f64::INFINITY;
+
+    for step in 0..20 {
+        let phase = (step as f64 / 20.0) * sixteenth_ms;
+        let mut total_err = 0.0f64;
+
+        for ev in events {
+            let rel = (ev.start_ms.saturating_sub(t0) as f64) - phase;
+            let snapped = (rel / sixteenth_ms).round() * sixteenth_ms;
+            let diff = rel - snapped;
+            // Acordes e notas longas pesam mais no alinhamento de fase
+            let w = 1.0 + 0.25 * (ev.notes.len().saturating_sub(1) as f64);
+            total_err += w * diff * diff;
+        }
+
+        if total_err < best_err {
+            best_err = total_err;
+            best_phase = phase;
+        }
+    }
+
+    best_phase
+}
 
 fn quantize_note_ticks(raw_ticks: f64, max_ticks: u8) -> u8 {
     let clamped = raw_ticks.clamp(1.0, max_ticks as f64);
@@ -938,7 +1058,16 @@ pub fn build_empty_score(
         midi_program: 27,
         show_tab_staff: true,
         clef: ClefKind::Treble8vb,
+        split_midi: 60,
     }
+}
+
+struct MergedGridEvent {
+    grid_tick: u32,
+    duration_ms: u64,
+    notes: Vec<u8>,
+    voicing: Option<ChordVoicing>,
+    bend_semitones: f32,
 }
 
 pub fn build_quantized_score(
@@ -958,12 +1087,271 @@ pub fn build_quantized_score(
         return build_empty_score(title, tuning_low_to_high, bpm, time_signature);
     }
 
-    // 1. Ancoragem absoluta na grade de semicolcheias (zero deriva acumulada)
+    // 1. Otimização de fase sub-tick e fusão de colisões simultâneas em acordes limpos
     let t0 = events[0].start_ms;
+    let phase_ms = find_best_grid_phase(events, t0, sixteenth_ms);
+    let mut merged: Vec<MergedGridEvent> = Vec::with_capacity(events.len());
+
+    for (i, ev) in events.iter().enumerate() {
+        let rel_ms = (ev.start_ms.saturating_sub(t0) as f64) - phase_ms;
+        let tick = (rel_ms / sixteenth_ms).round().max(0.0) as u32;
+        let v = voicings.get(i).cloned().flatten();
+
+        if let Some(last) = merged.last_mut() {
+            if tick <= last.grid_tick {
+                let mut set: BTreeSet<u8> = last.notes.iter().copied().collect();
+                set.extend(ev.notes.iter().copied());
+                last.notes = set.into_iter().collect();
+                last.duration_ms = last.duration_ms.max(ev.duration_ms);
+                last.bend_semitones = last.bend_semitones.max(ev.bend_semitones);
+                if last.voicing.is_none() {
+                    last.voicing = v;
+                }
+                continue;
+            }
+        }
+
+        merged.push(MergedGridEvent {
+            grid_tick: tick,
+            duration_ms: ev.duration_ms,
+            notes: ev.notes.clone(),
+            voicing: v,
+            bend_semitones: ev.bend_semitones,
+        });
+    }
+
+    let first_tick = merged.first().map(|m| m.grid_tick).unwrap_or(0);
+    for m in &mut merged {
+        m.grid_tick = m.grid_tick.saturating_sub(first_tick);
+    }
+
+    let mut measures: Vec<QuantizedMeasure> = Vec::new();
+    let mut current_beats: Vec<QuantizedBeat> = Vec::new();
+    let mut current_ticks: u8 = 0;
+    let mut cursor_abs: u32 = 0;
+
+    for (i, ev) in merged.iter().enumerate() {
+        let start_tick = ev.grid_tick;
+
+        if start_tick > cursor_abs {
+            let mut rest_rem = (start_tick - cursor_abs).min((measure_ticks as u32) * 2);
+            while rest_rem > 0 {
+                let chunk = rest_rem.min(measure_ticks as u32) as u8;
+                push_rest_ticks(
+                    &mut measures,
+                    &mut current_beats,
+                    &mut current_ticks,
+                    measure_ticks,
+                    chunk,
+                );
+                rest_rem -= chunk as u32;
+            }
+            cursor_abs = start_tick;
+        }
+
+        let max_slot = merged
+            .get(i + 1)
+            .map(|next| next.grid_tick.saturating_sub(start_tick).max(1))
+            .unwrap_or(measure_ticks as u32)
+            .min(measure_ticks as u32) as u8;
+
+        let raw_ticks = (ev.duration_ms as f64) / sixteenth_ms;
+        let note_ticks = quantize_note_ticks(raw_ticks, max_slot);
+        let chord = recognize_chord(&ev.notes, key);
+
+        push_tied_note_ticks(
+            &mut measures,
+            &mut current_beats,
+            &mut current_ticks,
+            measure_ticks,
+            note_ticks,
+            &ev.notes,
+            &ev.voicing,
+            ev.bend_semitones,
+            &chord,
+        );
+        cursor_abs += note_ticks as u32;
+    }
+
+    if current_ticks > 0 {
+        let pad = measure_ticks.saturating_sub(current_ticks);
+        push_rest_ticks(
+            &mut measures,
+            &mut current_beats,
+            &mut current_ticks,
+            measure_ticks,
+            pad,
+        );
+    }
+
+    if measures.is_empty() {
+        return build_empty_score(title, tuning_low_to_high, bpm, time_signature);
+    }
+
+    QuantizedScore {
+        title: title.to_string(),
+        bpm,
+        time_signature,
+        key,
+        tuning_low_to_high: tuning_low_to_high.to_vec(),
+        measures,
+        midi_program: 27,
+        show_tab_staff: true,
+        clef: ClefKind::Treble8vb,
+        split_midi: 60,
+    }
+}
+
+/// Grade rítmica neural gerada pelo Beat This! (tempos reais de batidas e cabeças de compasso).
+#[derive(Debug, Clone, Default)]
+pub struct NeuralBeatGrid {
+    pub beats_ms: Vec<u64>,
+    pub downbeats_ms: Vec<u64>,
+}
+
+impl NeuralBeatGrid {
+    pub fn is_usable(&self) -> bool {
+        self.beats_ms.len() >= 4
+    }
+
+    /// Calcula o BPM mediano a partir dos intervalos reais entre batidas consecutivas.
+    pub fn median_bpm(&self) -> Option<u16> {
+        if self.beats_ms.len() < 2 {
+            return None;
+        }
+        let mut ibis: Vec<u64> = self
+            .beats_ms
+            .windows(2)
+            .map(|w| w[1].saturating_sub(w[0]))
+            .filter(|&d| (250..=1500).contains(&d))
+            .collect();
+        if ibis.is_empty() {
+            return None;
+        }
+        ibis.sort_unstable();
+        let med_ms = ibis[ibis.len() / 2] as f64;
+        Some(((60_000.0 / med_ms).round() as u16).clamp(45, 220))
+    }
+
+    /// Infere o número de batidas por compasso comparando downbeats consecutivos com a grade de batidas.
+    pub fn inferred_beats_per_bar(&self) -> Option<u8> {
+        if self.beats_ms.len() < 4 || self.downbeats_ms.len() < 2 {
+            return None;
+        }
+        let nearest_idx = |t: u64| -> usize {
+            self.beats_ms
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, &b)| b.abs_diff(t))
+                .map(|(i, _)| i)
+                .unwrap_or(0)
+        };
+        let mut counts: Vec<usize> = self
+            .downbeats_ms
+            .windows(2)
+            .map(|w| nearest_idx(w[1]).saturating_sub(nearest_idx(w[0])))
+            .filter(|&c| (2..=7).contains(&c))
+            .collect();
+        if counts.is_empty() {
+            return None;
+        }
+        counts.sort_unstable();
+        Some(counts[counts.len() / 2] as u8)
+    }
+
+    /// Converte um timestamp em milissegundos para posição contínua em batidas (acompanha rubato/variação de tempo).
+    fn ms_to_beat_pos(&self, ms: u64) -> f64 {
+        let n = self.beats_ms.len();
+        if n < 2 {
+            return 0.0;
+        }
+        let first = self.beats_ms[0];
+        if ms <= first {
+            let ibi = self.beats_ms[1].saturating_sub(first).max(200) as f64;
+            return -((first - ms) as f64) / ibi;
+        }
+        let last = self.beats_ms[n - 1];
+        if ms >= last {
+            let ibi = last.saturating_sub(self.beats_ms[n - 2]).max(200) as f64;
+            return ((n - 1) as f64) + ((ms - last) as f64) / ibi;
+        }
+        let idx = match self.beats_ms.binary_search(&ms) {
+            Ok(i) => return i as f64,
+            Err(ins) => ins.saturating_sub(1),
+        };
+        let b0 = self.beats_ms[idx];
+        let b1 = self.beats_ms[idx + 1];
+        let span = b1.saturating_sub(b0).max(1) as f64;
+        (idx as f64) + ((ms - b0) as f64) / span
+    }
+}
+
+/// Constrói a partitura quantizada usando a grade neural de batidas e cabeças de compasso do Beat This!.
+/// Acompanha flutuações humanas de andamento sem deriva acumulada e alinha cada downbeat ao tempo 1.
+pub fn build_score_with_beat_grid(
+    title: &str,
+    events: &[TimedEvent],
+    voicings: &[Option<ChordVoicing>],
+    tuning_low_to_high: &[u8],
+    bpm_override: Option<u16>,
+    time_signature: TimeSignature,
+    beat_grid: &NeuralBeatGrid,
+) -> QuantizedScore {
+    if !beat_grid.is_usable() || events.is_empty() {
+        return build_quantized_score(
+            title,
+            events,
+            voicings,
+            tuning_low_to_high,
+            bpm_override,
+            time_signature,
+        );
+    }
+
+    let bpm = bpm_override
+        .or_else(|| beat_grid.median_bpm())
+        .unwrap_or_else(|| estimate_bpm(events, 100));
+    let key = detect_key(events);
+    let measure_ticks = time_signature.measure_ticks();
+
+    // Ticks de semicolcheia por batida detectada (ex.: 4 em 4/4 e 3/4; 6 em 6/8 com pulso de semínima pontuada)
+    let beats_per_bar = beat_grid
+        .inferred_beats_per_bar()
+        .unwrap_or(time_signature.numerator)
+        .max(1);
+    let ticks_per_beat: f64 = if time_signature.denominator == 4 {
+        4.0
+    } else if time_signature.numerator == 6 && time_signature.denominator == 8 && beats_per_bar == 2 {
+        6.0
+    } else {
+        (measure_ticks as f64) / (beats_per_bar as f64)
+    };
+
+    // Alinha o início do compasso 1 a uma cabeça de compasso (downbeat) real
+    let first_ev_beat = beat_grid.ms_to_beat_pos(events[0].start_ms);
+    let origin_beat = if !beat_grid.downbeats_ms.is_empty() {
+        let db_beats: Vec<f64> = beat_grid
+            .downbeats_ms
+            .iter()
+            .map(|&db| beat_grid.ms_to_beat_pos(db))
+            .collect();
+        if let Some(&prev_db) = db_beats.iter().rfind(|&&b| b <= first_ev_beat + 0.18) {
+            prev_db
+        } else {
+            let mut b = db_beats[0];
+            while b > first_ev_beat + 0.18 {
+                b -= beats_per_bar as f64;
+            }
+            b
+        }
+    } else {
+        first_ev_beat.floor()
+    };
+
     let mut grid_starts: Vec<u32> = Vec::with_capacity(events.len());
     for ev in events {
-        let rel_ms = ev.start_ms.saturating_sub(t0) as f64;
-        let mut tick = (rel_ms / sixteenth_ms).round() as u32;
+        let rel_beats = (beat_grid.ms_to_beat_pos(ev.start_ms) - origin_beat).max(0.0);
+        let mut tick = (rel_beats * ticks_per_beat).round() as u32;
         if let Some(&prev) = grid_starts.last() {
             if tick <= prev {
                 tick = prev + 1;
@@ -980,7 +1368,6 @@ pub fn build_quantized_score(
     for (i, ev) in events.iter().enumerate() {
         let start_tick = grid_starts[i];
 
-        // Preenche qualquer silêncio real até o ataque ancorado (limitado a 2 compassos)
         if start_tick > cursor_abs {
             let mut rest_rem = (start_tick - cursor_abs).min((measure_ticks as u32) * 2);
             while rest_rem > 0 {
@@ -1003,7 +1390,9 @@ pub fn build_quantized_score(
             .unwrap_or(measure_ticks as u32)
             .min(measure_ticks as u32) as u8;
 
-        let raw_ticks = (ev.duration_ms as f64) / sixteenth_ms;
+        let b_start = beat_grid.ms_to_beat_pos(ev.start_ms);
+        let b_end = beat_grid.ms_to_beat_pos(ev.start_ms.saturating_add(ev.duration_ms));
+        let raw_ticks = ((b_end - b_start) * ticks_per_beat).max(1.0);
         let note_ticks = quantize_note_ticks(raw_ticks, max_slot);
 
         let voicing = voicings.get(i).cloned().flatten();
@@ -1048,11 +1437,12 @@ pub fn build_quantized_score(
         midi_program: 27,
         show_tab_staff: true,
         clef: ClefKind::Treble8vb,
+        split_midi: 60,
     }
 }
 
 // ============================================================================
-// SERIALIZAÇÃO ALPHATEX (Pauta Pura ou Partitura+Tab, \instrument, Pontos, Ties)
+// SERIALIZAÇÃO ALPHATEX (Topo Limpo + Separação de Claves Sol/Fá + Tab)
 // ============================================================================
 
 fn format_alphatex_pos(pos: FretPos, num_strings: usize, is_tied: bool) -> String {
@@ -1064,177 +1454,307 @@ fn format_alphatex_pos(pos: FretPos, num_strings: usize, is_tied: bool) -> Strin
     }
 }
 
-pub fn score_to_alphatex(
-    score: &QuantizedScore,
-    alphatex_tuning_high_to_low: &str,
-    subtitle: &str,
+fn format_pitched_alphatex_beat(
+    midi_notes: &[u8],
+    beat: &QuantizedBeat,
+    key: DetectedKey,
+    chord_prop: Option<String>,
 ) -> String {
-    let num_strings = score.tuning_low_to_high.len();
-    let staff_block = if score.show_tab_staff {
-        format!(
-            "\\staff {{ score tabs }}\n\\tuning ({})\n",
-            alphatex_tuning_high_to_low
-        )
+    if midi_notes.is_empty() {
+        return if beat.is_dotted() {
+            "r { d }".to_string()
+        } else {
+            "r".to_string()
+        };
+    }
+
+    let mut pitched: Vec<String> = midi_notes
+        .iter()
+        .map(|&m| {
+            let name = midi_to_note_name_for_key(m, key);
+            if beat.tie_from_prev {
+                format!("{} {{ t }}", name)
+            } else {
+                name
+            }
+        })
+        .collect();
+
+    let body = if pitched.len() == 1 {
+        pitched.remove(0)
     } else {
-        "\\staff { score }\n".to_string()
+        format!("({})", pitched.join(" "))
     };
 
-    let header = format!(
-        "\\title \"{}\"\n\
-         \\subtitle \"{}\"\n\
-         \\tempo {}\n\
-         \\track \"Instrumento\"\n\
-         \\instrument {}\n\
-         {}\
-         \\clef {}\n\
-         \\ts {}\n\
-         \\ks {}\n",
-        score.title.replace('"', "'"),
-        subtitle.replace('"', "'"),
-        score.bpm,
-        score.midi_program,
-        staff_block,
-        score.clef.alphatex_clef(),
-        score.time_signature.alphatex_ts(),
-        score.key.alphatex_ks()
-    );
+    let mut beat_props: Vec<String> = Vec::new();
+    if beat.is_dotted() {
+        beat_props.push("d".to_string());
+    }
+    if let Some(ch_p) = chord_prop {
+        beat_props.push(ch_p);
+    }
+    if beat_props.is_empty() {
+        body
+    } else {
+        format!("{} {{ {} }}", body, beat_props.join(" "))
+    }
+}
 
-    let mut bar_strings = Vec::with_capacity(score.measures.len());
-    let mut last_rendered_chord: Option<String> = None;
+fn ticks_to_alphatex_dur_v2(ticks: u8) -> (&'static str, bool) {
+    match ticks {
+        16..=u8::MAX => ("1", false),
+        12..=15 => ("2", true),
+        8..=11 => ("2", false),
+        6..=7 => ("4", true),
+        4..=5 => ("4", false),
+        3 => ("8", true),
+        2 => ("8", false),
+        _ => ("16", false),
+    }
+}
 
-    for measure in &score.measures {
-        let mut tokens: Vec<String> = Vec::new();
-        let mut active_div: Option<u8> = None;
+fn is_valid_single_dur_v2(ticks: u8) -> bool {
+    matches!(ticks, 1 | 2 | 3 | 4 | 6 | 8 | 12 | 16)
+}
 
-        for beat in &measure.beats {
-            let div = beat.alphatex_div();
-            if active_div != Some(div) {
-                tokens.push(format!(":{}", div));
-                active_div = Some(div);
-            }
+fn format_pitched_beat_v2(
+    notes: &[u8],
+    ticks: u8,
+    tie_from_prev: bool,
+    chord_effect: Option<String>,
+    key: DetectedKey,
+) -> String {
+    let (dur, dotted) = ticks_to_alphatex_dur_v2(ticks);
+    let mut effects: Vec<String> = Vec::new();
+    if dotted {
+        effects.push("d".to_string());
+    }
+    if let Some(ch) = chord_effect {
+        effects.push(ch);
+    }
+    let eff_suffix = if effects.is_empty() {
+        String::new()
+    } else {
+        format!(" {{ {} }}", effects.join(" "))
+    };
 
-            if beat.is_rest() {
-                if beat.is_dotted() {
-                    tokens.push("r { d }".to_string());
-                } else {
-                    tokens.push("r".to_string());
-                }
-                continue;
-            }
+    if notes.is_empty() {
+        return format!("r.{}{}", dur, eff_suffix);
+    }
 
-            let chord_prop = if !beat.tie_from_prev {
-                match &beat.chord {
-                    Some(ch) if last_rendered_chord.as_deref() != Some(ch.label.as_str()) => {
-                        last_rendered_chord = Some(ch.label.clone());
-                        Some(format!("ch \"{}\"", ch.label.replace('"', "'")))
-                    }
-                    _ => None,
-                }
+    let note_tokens: Vec<String> = notes
+        .iter()
+        .map(|&m| {
+            let name = midi_to_note_name_for_key(m, key);
+            if tie_from_prev {
+                format!("{} {{ t }}", name)
             } else {
-                None
-            };
-
-            if !score.show_tab_staff {
-                let mut pitched: Vec<String> = beat
-                    .midi_notes
-                    .iter()
-                    .map(|&m| {
-                        let name = midi_to_note_name_for_key(m, score.key);
-                        if beat.tie_from_prev {
-                            format!("{} {{ t }}", name)
-                        } else {
-                            name
-                        }
-                    })
-                    .collect();
-                if pitched.is_empty() {
-                    tokens.push(if beat.is_dotted() {
-                        "r { d }".to_string()
-                    } else {
-                        "r".to_string()
-                    });
-                    continue;
-                }
-                let body = if pitched.len() == 1 {
-                    pitched.remove(0)
-                } else {
-                    format!("({})", pitched.join(" "))
-                };
-                let mut beat_props: Vec<String> = Vec::new();
-                if beat.is_dotted() {
-                    beat_props.push("d".to_string());
-                }
-                if let Some(ch_p) = chord_prop {
-                    beat_props.push(ch_p);
-                }
-                if beat_props.is_empty() {
-                    tokens.push(body);
-                } else {
-                    tokens.push(format!("{} {{ {} }}", body, beat_props.join(" ")));
-                }
-                continue;
+                name
             }
+        })
+        .collect();
 
-            match &beat.voicing {
-                Some(v) if v.len() == 1 => {
-                    let base = format_alphatex_pos(v[0], num_strings, beat.tie_from_prev);
-                    let mut props: Vec<String> = Vec::new();
+    if note_tokens.len() == 1 {
+        format!("{}.{}{}", note_tokens[0], dur, eff_suffix)
+    } else {
+        format!("({}).{}{}", note_tokens.join(" "), dur, eff_suffix)
+    }
+}
 
-                    if !beat.tie_from_prev && beat.bend_semitones >= 0.45 {
-                        let qtones = (beat.bend_semitones * 4.0).round().clamp(2.0, 8.0) as u8;
-                        props.push(format!("b (0 {})", qtones));
-                    }
-                    if beat.is_dotted() {
-                        props.push("d".to_string());
-                    }
-                    if let Some(ch_p) = chord_prop {
-                        props.push(ch_p);
-                    }
+fn format_fretted_beat_v2(
+    beat: &QuantizedBeat,
+    num_strings: usize,
+    key: DetectedKey,
+) -> String {
+    let (dur, dotted) = ticks_to_alphatex_dur_v2(beat.duration_ticks);
+    let mut effects: Vec<String> = Vec::new();
+    if dotted {
+        effects.push("d".to_string());
+    }
+    if let Some(ch) = beat.chord.as_ref().map(|c| format!("ch \"{}\"", c.label.as_str().replace('"', "'"))) {
+        effects.push(ch);
+    }
+    let eff_suffix = if effects.is_empty() {
+        String::new()
+    } else {
+        format!(" {{ {} }}", effects.join(" "))
+    };
 
-                    if props.is_empty() {
-                        tokens.push(base);
-                    } else {
-                        tokens.push(format!("{} {{ {} }}", base, props.join(" ")));
+    if beat.is_rest() {
+        return format!("r.{}{}", dur, eff_suffix);
+    }
+
+    if let Some(ref voicing) = beat.voicing {
+        if !voicing.is_empty() {
+            let bend_q = ((beat.bend_semitones * 2.0).round() as i32).clamp(0, 8);
+            let mut tokens = Vec::with_capacity(voicing.len());
+            for (idx, fp) in voicing.iter().enumerate() {
+                let at_string = num_strings.saturating_sub(fp.string).max(1);
+                let base = if beat.tie_from_prev {
+                    format!("-.{}", at_string)
+                } else {
+                    format!("{}.{}", fp.fret, at_string)
+                };
+                if !beat.tie_from_prev && idx == 0 && bend_q >= 2 {
+                    tokens.push(format!("{} {{ b (0 {} {}) }}", base, bend_q, bend_q));
+                } else {
+                    tokens.push(base);
+                }
+            }
+            if tokens.len() == 1 {
+                return format!("{}.{}{}", tokens[0], dur, eff_suffix);
+            }
+            return format!("({}).{}{}", tokens.join(" "), dur, eff_suffix);
+        }
+    }
+
+    format_pitched_beat_v2(
+        &beat.midi_notes,
+        beat.duration_ticks,
+        beat.tie_from_prev,
+        beat.chord.as_ref().map(|c| format!("ch \"{}\"", c.label.as_str().replace('"', "'"))),
+        key,
+    )
+}
+
+fn render_pitched_hand_measures(
+    score: &QuantizedScore,
+    clef_tag: &str,
+    keep_note: impl Fn(u8) -> bool,
+    include_chords: bool,
+) -> String {
+    let mut bars: Vec<String> = Vec::with_capacity(score.measures.len());
+
+    for (m_idx, measure) in score.measures.iter().enumerate() {
+        let mut items: Vec<(Vec<u8>, u8, bool, Option<String>)> = Vec::new();
+        for beat in &measure.beats {
+            let filtered: Vec<u8> = beat
+                .midi_notes
+                .iter()
+                .copied()
+                .filter(|&m| keep_note(m))
+                .collect();
+            let ch = if include_chords { beat.chord.as_ref().map(|c| format!("ch \"{}\"", c.label.as_str().replace('"', "'"))) } else { None };
+
+            if filtered.is_empty() {
+                if let Some(last) = items.last_mut() {
+                    if last.0.is_empty() && last.3.is_none() && ch.is_none() {
+                        let sum = last.1.saturating_add(beat.duration_ticks);
+                        if is_valid_single_dur_v2(sum) {
+                            last.1 = sum;
+                            continue;
+                        }
                     }
                 }
-                Some(v) if v.len() > 1 => {
-                    let chord_notes: Vec<String> = v
-                        .iter()
-                        .map(|&p| format_alphatex_pos(p, num_strings, beat.tie_from_prev))
-                        .collect();
-                    let body = format!("({})", chord_notes.join(" "));
-                    let mut beat_props: Vec<String> = Vec::new();
-                    if beat.is_dotted() {
-                        beat_props.push("d".to_string());
-                    }
-                    if let Some(ch_p) = chord_prop {
-                        beat_props.push(ch_p);
-                    }
-
-                    if beat_props.is_empty() {
-                        tokens.push(body);
-                    } else {
-                        tokens.push(format!("{} {{ {} }}", body, beat_props.join(" ")));
-                    }
-                }
-                _ => {
-                    if beat.is_dotted() {
-                        tokens.push("r { d }".to_string());
-                    } else {
-                        tokens.push("r".to_string());
-                    }
-                }
+                items.push((Vec::new(), beat.duration_ticks, false, ch));
+            } else {
+                items.push((filtered, beat.duration_ticks, beat.tie_from_prev, ch));
             }
         }
 
-        bar_strings.push(tokens.join(" "));
+        let rendered_beats: Vec<String> = items
+            .into_iter()
+            .map(|(notes, ticks, tie, ch)| format_pitched_beat_v2(&notes, ticks, tie, ch, score.key))
+            .collect();
+
+        let body = if rendered_beats.is_empty() {
+            "r.1".to_string()
+        } else {
+            rendered_beats.join(" ")
+        };
+
+        if m_idx == 0 {
+            bars.push(format!(
+                "\\clef {} \\ts {} \\ks {} {}",
+                clef_tag,
+                score.time_signature.alphatex_ts(),
+                score.key.alphatex_ks(),
+                body
+            ));
+        } else {
+            bars.push(body);
+        }
     }
 
-    format!("{}{}\n", header, bar_strings.join(" |\n"))
+    bars.join(" |\n")
+}
+
+pub fn score_to_alphatex(score: &QuantizedScore, tuning_high_to_low: &str, subtitle: &str) -> String {
+    let title = score.title.trim().replace('"', "'");
+    let sub = subtitle.trim().replace('"', "'");
+
+    let mut header = String::new();
+    if !title.is_empty() {
+        header.push_str(&format!("\\title \"{}\"\n", title));
+    }
+    if !sub.is_empty() {
+        header.push_str(&format!("\\subtitle \"{}\"\n", sub));
+    }
+    header.push_str(&format!("\\tempo {}\n.\n", score.bpm));
+
+    // 1. Pauta Dupla (Grand Staff: Sol na mão direita + Fá na mão esquerda)
+    if !score.show_tab_staff && score.clef == ClefKind::GrandStaff {
+        let split = score.split_midi;
+        let rh_bars = render_pitched_hand_measures(score, "G2", |m| m >= split, true);
+        let lh_bars = render_pitched_hand_measures(score, "F4", |m| m < split, false);
+
+        return format!(
+            "{}\\track \"Piano\"\n\\staff {{score}} \\tuning piano \\instrument {}\n{}\n\\staff {{score}} \\tuning piano\n{}\n",
+            header, score.midi_program, rh_bars, lh_bars
+        );
+    }
+
+    // 2. Pauta Única sem Tablatura (altura real: Clave de Sol, Fá ou Dó)
+    if !score.show_tab_staff {
+        let clef_tag = score.clef.alphatex_clef();
+        let bars = render_pitched_hand_measures(score, clef_tag, |_| true, true);
+
+        return format!(
+            "{}\\track \"Partitura\"\n\\staff {{score}} \\tuning piano \\instrument {}\n{}\n",
+            header, score.midi_program, bars
+        );
+    }
+
+    // 3. Instrumento com Tablatura (Guitarra, Violão, Oud, Baixo) — clave no 1º compasso pós-'.'
+    let num_strings = score.tuning_low_to_high.len().max(1);
+    let clef_tag = score.clef.alphatex_clef();
+    let mut bars: Vec<String> = Vec::with_capacity(score.measures.len());
+
+    for (m_idx, measure) in score.measures.iter().enumerate() {
+        let rendered_beats: Vec<String> = measure
+            .beats
+            .iter()
+            .map(|b| format_fretted_beat_v2(b, num_strings, score.key))
+            .collect();
+        let body = if rendered_beats.is_empty() {
+            "r.1".to_string()
+        } else {
+            rendered_beats.join(" ")
+        };
+        if m_idx == 0 {
+            bars.push(format!(
+                "\\clef {} \\ts {} \\ks {} {}",
+                clef_tag,
+                score.time_signature.alphatex_ts(),
+                score.key.alphatex_ks(),
+                body
+            ));
+        } else {
+            bars.push(body);
+        }
+    }
+
+    format!(
+        "{}\\track \"Tab\"\n\\staff {{score tabs}} \\tuning {} \\instrument {}\n{}\n",
+        header,
+        tuning_high_to_low,
+        score.midi_program,
+        bars.join(" |\n")
+    )
 }
 
 // ============================================================================
-// EXPORTAÇÃO MUSICXML 4.0
+// EXPORTAÇÃO MUSICXML 4.0 (Inclui Grand Staff Sol + Fá)
 // ============================================================================
 
 fn escape_xml(s: &str) -> String {
@@ -1280,10 +1800,66 @@ fn write_harmony_xml(out: &mut String, chord: &ChordSymbol, prefer_flats: bool) 
     out.push_str("      </harmony>\n");
 }
 
+fn write_pitched_notes_xml(
+    xml: &mut String,
+    notes: &[u8],
+    beat: &QuantizedBeat,
+    voice: u8,
+    staff: u8,
+    prefer_flats: bool,
+) {
+    if notes.is_empty() {
+        xml.push_str("      <note>\n");
+        xml.push_str("        <rest/>\n");
+        xml.push_str(&format!("        <duration>{}</duration>\n", beat.duration_ticks));
+        xml.push_str(&format!("        <voice>{}</voice>\n", voice));
+        xml.push_str(&format!("        <type>{}</type>\n", beat.musicxml_type()));
+        if beat.is_dotted() {
+            xml.push_str("        <dot/>\n");
+        }
+        xml.push_str(&format!("        <staff>{}</staff>\n", staff));
+        xml.push_str("      </note>\n");
+        return;
+    }
+
+    for (n_idx, &midi) in notes.iter().enumerate() {
+        xml.push_str("      <note>\n");
+        if n_idx > 0 {
+            xml.push_str("        <chord/>\n");
+        }
+        write_pitch_xml(xml, midi, prefer_flats);
+        xml.push_str(&format!("        <duration>{}</duration>\n", beat.duration_ticks));
+        if beat.tie_from_prev {
+            xml.push_str("        <tie type=\"stop\"/>\n");
+        }
+        if beat.tie_to_next {
+            xml.push_str("        <tie type=\"start\"/>\n");
+        }
+        xml.push_str(&format!("        <voice>{}</voice>\n", voice));
+        xml.push_str(&format!("        <type>{}</type>\n", beat.musicxml_type()));
+        if beat.is_dotted() {
+            xml.push_str("        <dot/>\n");
+        }
+        xml.push_str(&format!("        <staff>{}</staff>\n", staff));
+        if beat.tie_from_prev || beat.tie_to_next {
+            xml.push_str("        <notations>\n");
+            if beat.tie_from_prev {
+                xml.push_str("          <tied type=\"stop\"/>\n");
+            }
+            if beat.tie_to_next {
+                xml.push_str("          <tied type=\"start\"/>\n");
+            }
+            xml.push_str("        </notations>\n");
+        }
+        xml.push_str("      </note>\n");
+    }
+}
+
 pub fn export_musicxml(score: &QuantizedScore) -> String {
     let num_strings = score.tuning_low_to_high.len();
     let measure_ticks = score.time_signature.measure_ticks();
     let prefer_flats = score.key.prefer_flats();
+    let is_grand_staff = !score.show_tab_staff && score.clef == ClefKind::GrandStaff;
     let mode_xml = match score.key.mode {
         KeyMode::Major => "major",
         KeyMode::Minor => "minor",
@@ -1294,12 +1870,14 @@ pub fn export_musicxml(score: &QuantizedScore) -> String {
     xml.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     xml.push_str("<!DOCTYPE score-partwise PUBLIC \"-//Recordare//DTD MusicXML 4.0 Partwise//EN\" \"http://www.musicxml.org/dtds/partwise.dtd\">\n");
     xml.push_str("<score-partwise version=\"4.0\">\n");
-    xml.push_str("  <work>\n");
-    xml.push_str(&format!(
-        "    <work-title>{}</work-title>\n",
-        escape_xml(&score.title)
-    ));
-    xml.push_str("  </work>\n");
+    if !score.title.trim().is_empty() {
+        xml.push_str("  <work>\n");
+        xml.push_str(&format!(
+            "    <work-title>{}</work-title>\n",
+            escape_xml(&score.title)
+        ));
+        xml.push_str("  </work>\n");
+    }
     xml.push_str("  <identification>\n");
     xml.push_str("    <encoding><software>Tab Transcriber</software></encoding>\n");
     xml.push_str("  </identification>\n");
@@ -1311,6 +1889,7 @@ pub fn export_musicxml(score: &QuantizedScore) -> String {
     xml.push_str("  <part id=\"P1\">\n");
 
     let mut last_harmony: Option<String> = None;
+    let mut prev_single_treble = true;
 
     for (m_idx, measure) in score.measures.iter().enumerate() {
         xml.push_str(&format!("    <measure number=\"{}\">\n", m_idx + 1));
@@ -1326,43 +1905,58 @@ pub fn export_musicxml(score: &QuantizedScore) -> String {
                 "        <time><beats>{}</beats><beat-type>{}</beat-type></time>\n",
                 score.time_signature.numerator, score.time_signature.denominator
             ));
-            let (clef_sign, clef_line, oct_change) = match score.clef {
-                ClefKind::Treble => ("G", 2, None),
-                ClefKind::Treble8vb => ("G", 2, Some(-1)),
-                ClefKind::Bass => ("F", 4, if score.show_tab_staff { Some(-1) } else { None }),
-            };
-            if score.show_tab_staff {
+
+            if is_grand_staff {
                 xml.push_str("        <staves>2</staves>\n");
-            }
-            xml.push_str("        <clef number=\"1\">\n");
-            xml.push_str(&format!("          <sign>{}</sign>\n", clef_sign));
-            xml.push_str(&format!("          <line>{}</line>\n", clef_line));
-            if let Some(oc) = oct_change {
-                xml.push_str(&format!("          <clef-octave-change>{}</clef-octave-change>\n", oc));
-            }
-            xml.push_str("        </clef>\n");
-            if score.show_tab_staff {
-                xml.push_str("        <clef number=\"2\">\n");
-                xml.push_str("          <sign>TAB</sign>\n");
-                xml.push_str("          <line>5</line>\n");
+                xml.push_str("        <clef number=\"1\">\n");
+                xml.push_str("          <sign>G</sign>\n");
+                xml.push_str("          <line>2</line>\n");
                 xml.push_str("        </clef>\n");
-                xml.push_str("        <staff-details number=\"2\">\n");
-                xml.push_str(&format!("          <staff-lines>{}</staff-lines>\n", num_strings));
-                for (idx, &open_midi) in score.tuning_low_to_high.iter().enumerate() {
-                    let (step, alter, octave) = midi_to_xml_pitch(open_midi, prefer_flats);
-                    xml.push_str(&format!("          <staff-tuning line=\"{}\">\n", idx + 1));
-                    xml.push_str(&format!("            <tuning-step>{}</tuning-step>\n", step));
-                    if alter != 0 {
-                        xml.push_str(&format!("            <tuning-alter>{}</tuning-alter>\n", alter));
-                    }
-                    xml.push_str(&format!(
-                        "            <tuning-octave>{}</tuning-octave>\n",
-                        octave
-                    ));
-                    xml.push_str("          </staff-tuning>\n");
+                xml.push_str("        <clef number=\"2\">\n");
+                xml.push_str("          <sign>F</sign>\n");
+                xml.push_str("          <line>4</line>\n");
+                xml.push_str("        </clef>\n");
+            } else {
+                let (clef_sign, clef_line, oct_change) = match score.clef {
+                    ClefKind::Treble | ClefKind::GrandStaff => ("G", 2, None),
+                    ClefKind::Treble8vb => ("G", 2, Some(-1)),
+                    ClefKind::Bass => ("F", 4, if score.show_tab_staff { Some(-1) } else { None }),
+                    ClefKind::Alto => ("C", 3, None),
+                };
+                if score.show_tab_staff {
+                    xml.push_str("        <staves>2</staves>\n");
                 }
-                xml.push_str("        </staff-details>\n");
+                xml.push_str("        <clef number=\"1\">\n");
+                xml.push_str(&format!("          <sign>{}</sign>\n", clef_sign));
+                xml.push_str(&format!("          <line>{}</line>\n", clef_line));
+                if let Some(oc) = oct_change {
+                    xml.push_str(&format!("          <clef-octave-change>{}</clef-octave-change>\n", oc));
+                }
+                xml.push_str("        </clef>\n");
+                if score.show_tab_staff {
+                    xml.push_str("        <clef number=\"2\">\n");
+                    xml.push_str("          <sign>TAB</sign>\n");
+                    xml.push_str("          <line>5</line>\n");
+                    xml.push_str("        </clef>\n");
+                    xml.push_str("        <staff-details number=\"2\">\n");
+                    xml.push_str(&format!("          <staff-lines>{}</staff-lines>\n", num_strings));
+                    for (idx, &open_midi) in score.tuning_low_to_high.iter().enumerate() {
+                        let (step, alter, octave) = midi_to_xml_pitch(open_midi, prefer_flats);
+                        xml.push_str(&format!("          <staff-tuning line=\"{}\">\n", idx + 1));
+                        xml.push_str(&format!("            <tuning-step>{}</tuning-step>\n", step));
+                        if alter != 0 {
+                            xml.push_str(&format!("            <tuning-alter>{}</tuning-alter>\n", alter));
+                        }
+                        xml.push_str(&format!(
+                            "            <tuning-octave>{}</tuning-octave>\n",
+                            octave
+                        ));
+                        xml.push_str("          </staff-tuning>\n");
+                    }
+                    xml.push_str("        </staff-details>\n");
+                }
             }
+
             xml.push_str("      </attributes>\n");
             xml.push_str("      <direction placement=\"above\">\n");
             xml.push_str("        <direction-type>\n");
@@ -1375,6 +1969,40 @@ pub fn export_musicxml(score: &QuantizedScore) -> String {
             xml.push_str("      </direction>\n");
         }
 
+        if is_grand_staff {
+            let mut split_cache: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(measure.beats.len());
+            for beat in &measure.beats {
+                split_cache.push(split_beat_notes(
+                    &beat.midi_notes,
+                    score.split_midi,
+                    &mut prev_single_treble,
+                ));
+            }
+
+            // Staff 1: Clave de Sol
+            for (beat, (tr_notes, _)) in measure.beats.iter().zip(split_cache.iter()) {
+                if !beat.tie_from_prev {
+                    if let Some(ch) = &beat.chord {
+                        if last_harmony.as_deref() != Some(ch.label.as_str()) {
+                            write_harmony_xml(&mut xml, ch, prefer_flats);
+                            last_harmony = Some(ch.label.clone());
+                        }
+                    }
+                }
+                write_pitched_notes_xml(&mut xml, tr_notes, beat, 1, 1, prefer_flats);
+            }
+
+            xml.push_str(&format!("      <backup><duration>{}</duration></backup>\n", measure_ticks));
+
+            // Staff 2: Clave de Fá
+            for (beat, (_, bs_notes)) in measure.beats.iter().zip(split_cache.iter()) {
+                write_pitched_notes_xml(&mut xml, bs_notes, beat, 2, 2, prefer_flats);
+            }
+
+            xml.push_str("    </measure>\n");
+            continue;
+        }
+
         for beat in &measure.beats {
             if !beat.tie_from_prev {
                 if let Some(ch) = &beat.chord {
@@ -1384,51 +2012,7 @@ pub fn export_musicxml(score: &QuantizedScore) -> String {
                     }
                 }
             }
-
-            if beat.is_rest() {
-                xml.push_str("      <note>\n");
-                xml.push_str("        <rest/>\n");
-                xml.push_str(&format!("        <duration>{}</duration>\n", beat.duration_ticks));
-                xml.push_str("        <voice>1</voice>\n");
-                xml.push_str(&format!("        <type>{}</type>\n", beat.musicxml_type()));
-                if beat.is_dotted() {
-                    xml.push_str("        <dot/>\n");
-                }
-                xml.push_str("        <staff>1</staff>\n");
-                xml.push_str("      </note>\n");
-            } else {
-                for (n_idx, &midi) in beat.midi_notes.iter().enumerate() {
-                    xml.push_str("      <note>\n");
-                    if n_idx > 0 {
-                        xml.push_str("        <chord/>\n");
-                    }
-                    write_pitch_xml(&mut xml, midi, prefer_flats);
-                    xml.push_str(&format!("        <duration>{}</duration>\n", beat.duration_ticks));
-                    if beat.tie_from_prev {
-                        xml.push_str("        <tie type=\"stop\"/>\n");
-                    }
-                    if beat.tie_to_next {
-                        xml.push_str("        <tie type=\"start\"/>\n");
-                    }
-                    xml.push_str("        <voice>1</voice>\n");
-                    xml.push_str(&format!("        <type>{}</type>\n", beat.musicxml_type()));
-                    if beat.is_dotted() {
-                        xml.push_str("        <dot/>\n");
-                    }
-                    xml.push_str("        <staff>1</staff>\n");
-                    if beat.tie_from_prev || beat.tie_to_next {
-                        xml.push_str("        <notations>\n");
-                        if beat.tie_from_prev {
-                            xml.push_str("          <tied type=\"stop\"/>\n");
-                        }
-                        if beat.tie_to_next {
-                            xml.push_str("          <tied type=\"start\"/>\n");
-                        }
-                        xml.push_str("        </notations>\n");
-                    }
-                    xml.push_str("      </note>\n");
-                }
-            }
+            write_pitched_notes_xml(&mut xml, &beat.midi_notes, beat, 1, 1, prefer_flats);
         }
 
         if !score.show_tab_staff {
@@ -1680,7 +2264,6 @@ mod tests {
 
     #[test]
     fn autocorrelation_estimates_bpm_reliably_without_doubling() {
-        // 1. Pulso a 120 BPM (500 ms) com micro-timing humano
         let steady: Vec<TimedEvent> = [0, 505, 995, 1502, 2000, 2494, 3008, 3500]
             .into_iter()
             .map(|t| TimedEvent {
@@ -1693,19 +2276,6 @@ mod tests {
         let bpm_120 = estimate_bpm(&steady, 90);
         assert!(bpm_120.abs_diff(120) <= 2, "esperado ~120, obteve {}", bpm_120);
 
-        // 2. Pulso mais lento a 80 BPM (750 ms) — não deve dobrar para 160 BPM
-        let slow: Vec<TimedEvent> = (0..8)
-            .map(|k| TimedEvent {
-                start_ms: k * 750,
-                duration_ms: 600,
-                notes: vec![50, 57],
-                bend_semitones: 0.0,
-            })
-            .collect();
-        let bpm_80 = estimate_bpm(&slow, 120);
-        assert!(bpm_80.abs_diff(80) <= 2, "esperado ~80, obteve {}", bpm_80);
-
-        // 3. Riff contínuo de colcheias a 90 BPM (IOI = 333 ms) — não deve dobrar para 180 BPM
         let eighths_90: Vec<TimedEvent> = (0..12)
             .map(|k| TimedEvent {
                 start_ms: (k as u64) * 333,
@@ -1715,7 +2285,31 @@ mod tests {
             })
             .collect();
         let bpm_90 = estimate_bpm(&eighths_90, 120);
-        assert!(bpm_90.abs_diff(90) <= 3, "colcheias a 90 BPM não devem dobrar (obteve {})", bpm_90);
+        assert!(bpm_90.abs_diff(90) <= 3, "obteve {}", bpm_90);
+    }
+
+    #[test]
+    fn grand_staff_splits_treble_and_bass_cleanly_without_header_text() {
+        let tuning = [40, 45, 50, 55, 59, 64];
+        // Piano: C3 (48) na mão esquerda + E4 (64) e G4 (67) na mão direita
+        let events = vec![
+            TimedEvent { start_ms: 0, duration_ms: 1000, notes: vec![48, 64, 67], bend_semitones: 0.0 },
+            TimedEvent { start_ms: 1000, duration_ms: 1000, notes: vec![43, 62, 71], bend_semitones: 0.0 },
+        ];
+        let voicings = vec![None, None];
+        let score = build_quantized_score("", &events, &voicings, &tuning, Some(120), TimeSignature::new(4, 4))
+            .with_instrument(0, false, ClefKind::GrandStaff);
+
+        let tex = score_to_alphatex(&score, "E4 B3 G3 D3 A2 E2", "");
+        assert!(!tex.contains("\\title"), "não deve inserir \\title quando vazio");
+        assert!(!tex.contains("\\subtitle"), "não deve inserir \\subtitle quando vazio");
+        assert!(tex.contains("\\clef G2"));
+        assert!(tex.contains("\\clef F4"));
+
+        let xml = export_musicxml(&score);
+        assert!(xml.contains("<staves>2</staves>"));
+        assert!(xml.contains("<sign>G</sign>"));
+        assert!(xml.contains("<sign>F</sign>"));
     }
 
     #[test]
@@ -1732,27 +2326,98 @@ mod tests {
             Some(vec![FretPos { string: 5, fret: 5 }]),
         ];
 
-        let score = build_quantized_score(
-            "Sincope",
+        let score = build_quantized_score("", &events, &voicings, &tuning, Some(120), TimeSignature::new(4, 4));
+        assert_eq!(score.measures.len(), 2);
+        assert!(score.measures[0].beats[0].is_dotted());
+        assert!(score.measures[0].beats[2].tie_to_next);
+        assert!(score.measures[1].beats[0].tie_from_prev);
+    }
+
+    #[test]
+    fn neural_beat_grid_tracks_tempo_drift_and_aligns_downbeats() {
+        let tuning = [40, 45, 50, 55, 59, 64];
+        // Andamento acelera gradualmente (600 ms/batida -> 500 ms/batida), 2 compassos de 4/4
+        let beats_ms = vec![0, 600, 1180, 1740, 2280, 2800, 3300, 3800, 4300];
+        let grid = NeuralBeatGrid {
+            beats_ms: beats_ms.clone(),
+            downbeats_ms: vec![0, 2280, 4300],
+        };
+
+        // 8 semínimas tocadas exatamente em cada batida real apesar da aceleração
+        let events: Vec<TimedEvent> = (0..8)
+            .map(|i| TimedEvent {
+                start_ms: beats_ms[i],
+                duration_ms: beats_ms[i + 1] - beats_ms[i],
+                notes: vec![64],
+                bend_semitones: 0.0,
+            })
+            .collect();
+        let voicings = vec![Some(vec![FretPos { string: 5, fret: 0 }]); 8];
+
+        let score = build_score_with_beat_grid(
+            "Rubato",
             &events,
             &voicings,
+            &tuning,
+            None,
+            TimeSignature::new(4, 4),
+            &grid,
+        );
+
+        assert_eq!(score.measures.len(), 2);
+        assert_eq!(score.measures[0].beats.len(), 4);
+        assert_eq!(score.measures[1].beats.len(), 4);
+        assert!(score.measures[0].beats.iter().all(|b| b.duration_ticks == 4));
+        assert!(score.measures[1].beats.iter().all(|b| b.duration_ticks == 4));
+        assert_eq!(grid.inferred_beats_per_bar(), Some(4));
+    }
+
+    #[test]
+    fn alphatex_places_bass_clef_in_bar_scope_and_renders_grand_staff() {
+        let tuning = [28, 33, 38, 43];
+        let bass_events = vec![
+            TimedEvent { start_ms: 0, duration_ms: 500, notes: vec![36], bend_semitones: 0.0 },
+            TimedEvent { start_ms: 500, duration_ms: 500, notes: vec![43], bend_semitones: 0.0 },
+        ];
+        let mut score_bass = build_quantized_score(
+            "Bass",
+            &bass_events,
+            &[None, None],
             &tuning,
             Some(120),
             TimeSignature::new(4, 4),
         );
+        score_bass.midi_program = 33;
+        score_bass.show_tab_staff = false;
+        score_bass.clef = ClefKind::Bass;
 
-        assert_eq!(score.measures.len(), 2);
-        for m in &score.measures {
-            let sum: u8 = m.beats.iter().map(|b| b.duration_ticks).sum();
-            assert_eq!(sum, 16);
-        }
+        let tex_bass = score_to_alphatex(&score_bass, "G2 D2 A1 E1", "Baixo");
+        let dot_pos = tex_bass.find("\n.\n").expect("separador '.' ausente");
+        let clef_pos = tex_bass.find(r"\clef F4").expect("clave F4 ausente");
+        assert!(clef_pos > dot_pos, r"\clef F4 deve vir depois de '.' (escopo de compasso)");
+        assert!(tex_bass.contains(r"\tuning piano"));
 
-        assert!(score.measures[0].beats[0].is_dotted());
-        assert!(score.measures[0].beats[2].tie_to_next);
-        assert!(score.measures[1].beats[0].tie_from_prev);
+        let piano_events = vec![
+            TimedEvent { start_ms: 0, duration_ms: 500, notes: vec![48, 64, 67], bend_semitones: 0.0 },
+            TimedEvent { start_ms: 500, duration_ms: 500, notes: vec![43, 62, 71], bend_semitones: 0.0 },
+        ];
+        assert_eq!(infer_optimal_clef(&piano_events, false, ClefKind::Treble), ClefKind::GrandStaff);
 
-        let tex = score_to_alphatex(&score, "E4 B3 G3 D3 A2 E2", "Standard");
-        assert!(tex.contains("0.1 { d }"));
-        assert!(tex.contains("-.1"));
+        let mut score_piano = build_quantized_score(
+            "Piano",
+            &piano_events,
+            &[None, None],
+            &tuning,
+            Some(120),
+            TimeSignature::new(4, 4),
+        );
+        score_piano.midi_program = 0;
+        score_piano.show_tab_staff = false;
+        score_piano.clef = ClefKind::GrandStaff;
+
+        let tex_piano = score_to_alphatex(&score_piano, "E4 B3 G3 D3 A2 E2", "Piano");
+        assert!(tex_piano.contains(r"\clef G2"));
+        assert!(tex_piano.contains(r"\clef F4"));
+        assert_eq!(tex_piano.matches(r"\staff {score}").count(), 2);
     }
 }

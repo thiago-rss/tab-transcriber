@@ -44,6 +44,7 @@ pub struct WindowTranscription {
 pub struct DecodeConfig {
     pub onset_threshold: f32,
     pub frame_threshold: f32,
+    pub sustain_threshold: f32,
     pub legato_frame_threshold: f32,
     pub min_note_frames: usize,
     pub merge_gap_frames: usize,
@@ -53,6 +54,7 @@ pub struct DecodeConfig {
     pub max_polyphony: usize,
     pub relative_salience_ratio: f32,
     pub enable_overtone_pruning: bool,
+    pub enable_semitone_bleed_pruning: bool,
     pub overtone_octave_ratio: f32,
     pub overtone_fifth_ratio: f32,
     pub bend_min_cents: f32,
@@ -62,16 +64,18 @@ impl Default for DecodeConfig {
     fn default() -> Self {
         Self {
             onset_threshold: 0.48,
-            frame_threshold: 0.30,
-            legato_frame_threshold: 0.62,
+            frame_threshold: 0.34,
+            sustain_threshold: 0.24,
+            legato_frame_threshold: 0.64,
             min_note_frames: 6,
             merge_gap_frames: 3,
             chord_window_frames: 4,
-            min_midi: 36,
-            max_midi: 88,
+            min_midi: 28,
+            max_midi: 96,
             max_polyphony: 6,
-            relative_salience_ratio: 0.52,
+            relative_salience_ratio: 0.54,
             enable_overtone_pruning: true,
+            enable_semitone_bleed_pruning: true,
             overtone_octave_ratio: 0.78,
             overtone_fifth_ratio: 0.72,
             bend_min_cents: 70.0,
@@ -80,13 +84,12 @@ impl Default for DecodeConfig {
 }
 
 // ============================================================================
-// RESAMPLER POLYPHASE WINDOWED-SINC (32 TAPS, BLACKMAN-HARRIS, ZERO ALIASING)
+// RESAMPLER POLYPHASE WINDOWED-SINC (64 TAPS, BLACKMAN-HARRIS, ZERO ALIASING)
 // ============================================================================
 const SINC_TAPS: usize = 64;
 const SINC_HALF: usize = SINC_TAPS / 2;
 const SINC_PHASES: usize = 256;
 
-/// Reamostrador streaming com rejeição de aliasing > 85 dB (substitui o antigo interpolador linear).
 pub struct SincResampler {
     step: f64,
     read_pos: f64,
@@ -94,13 +97,11 @@ pub struct SincResampler {
     table: Vec<[f32; SINC_TAPS]>,
 }
 
-/// Alias retrocompatível para que todos os consumidores usem o resampler Windowed-Sinc.
 pub type LinearResampler = SincResampler;
 
 impl SincResampler {
     pub fn new(input_rate: f64, output_rate: f64) -> Self {
         let step = (input_rate / output_rate).max(0.05);
-        // Corte anti-aliasing em 0.44 * Nyquist da menor taxa (ex.: ~9.7 kHz @ 22.05 kHz)
         let fc = 0.44 * (output_rate / input_rate).min(1.0);
 
         let mut table = Vec::with_capacity(SINC_PHASES + 1);
@@ -114,7 +115,6 @@ impl SincResampler {
                 let x = (k as f64) - frac;
                 let u = ((x + SINC_HALF as f64) / (SINC_TAPS as f64)).clamp(0.0, 1.0);
 
-                // Janela Blackman-Harris de 4 termos (~92 dB de atenuação de lóbulos laterais)
                 let w = 0.35875
                     - 0.48829 * (2.0 * PI * u).cos()
                     + 0.14128 * (4.0 * PI * u).cos()
@@ -175,7 +175,6 @@ impl SincResampler {
             self.read_pos += self.step;
         }
 
-        // Compacta o buffer mantendo a cauda necessária de SINC_HALF amostras
         let pos_floor = self.read_pos.floor() as usize;
         if pos_floor > SINC_HALF + 512 {
             let drop_n = pos_floor - SINC_HALF;
@@ -184,7 +183,6 @@ impl SincResampler {
         }
     }
 
-    /// Drena a cauda do filtro FIR ao final de um arquivo offline.
     pub fn flush(&mut self, output: &mut Vec<f32>) {
         let pad = vec![0.0f32; SINC_HALF];
         self.push(&pad, output);
@@ -263,7 +261,9 @@ impl BasicPitchEngine {
             return Err("Dimensões divergentes entre tensores note e onset".into());
         }
 
-        let mut notes = decode_polyphonic_notes(note_data, onset_data, n_frames, n_bins, cfg);
+        let smoothed_notes = temporal_smooth_notes(note_data, n_frames, n_bins);
+        let mut notes =
+            decode_polyphonic_notes(&smoothed_notes, onset_data, n_frames, n_bins, cfg);
 
         for ev in &mut notes {
             let s_start = (ev.start_frame * FFT_HOP).min(window_22k.len());
@@ -286,11 +286,13 @@ impl BasicPitchEngine {
             None
         };
 
-        let pruned_overtones = if cfg.enable_overtone_pruning {
-            prune_phantom_overtones(&mut notes, cfg)
-        } else {
-            0
-        };
+        let mut pruned_overtones = 0;
+        if cfg.enable_semitone_bleed_pruning {
+            pruned_overtones += prune_semitone_bleed(&mut notes);
+        }
+        if cfg.enable_overtone_pruning {
+            pruned_overtones += prune_phantom_overtones(&mut notes, cfg);
+        }
 
         let chords = group_notes_into_chords(&notes, cfg);
         Ok(WindowTranscription {
@@ -300,8 +302,6 @@ impl BasicPitchEngine {
         })
     }
 
-    /// Transcreve um áudio completo (22.05 kHz mono) costurando as matrizes note/onset/contour
-    /// com descarte de bordas antes da decodificação — elimina cortes e notas duplicadas entre janelas.
     pub fn transcribe_audio_full(
         &mut self,
         audio_22k: &[f32],
@@ -316,7 +316,7 @@ impl BasicPitchEngine {
         }
 
         let hop_frames: usize = 86;
-        let hop_samples: usize = hop_frames * FFT_HOP; // 22.016 amostras
+        let hop_samples: usize = hop_frames * FFT_HOP;
 
         let mut full_notes: Vec<f32> = Vec::new();
         let mut full_onsets: Vec<f32> = Vec::new();
@@ -365,7 +365,6 @@ impl BasicPitchEngine {
             let is_last = end_sample >= audio_22k.len();
             let valid_frames = ((valid_samples + FFT_HOP - 1) / FFT_HOP).min(n_frames);
 
-            // Descarte simétrico das bordas ruidosas: janela 0 -> [0..129), meio -> [43..129), fim -> [43..valid)
             let keep_start = if is_first { 0 } else { (hop_frames / 2).min(n_frames) };
             let keep_end = if is_last {
                 valid_frames
@@ -405,8 +404,9 @@ impl BasicPitchEngine {
             });
         }
 
+        let smoothed_notes = temporal_smooth_notes(&full_notes, total_stitched_frames, n_note_bins);
         let mut notes = decode_polyphonic_notes(
-            &full_notes,
+            &smoothed_notes,
             &full_onsets,
             total_stitched_frames,
             n_note_bins,
@@ -422,23 +422,26 @@ impl BasicPitchEngine {
             }
         }
 
-        let estimated_a4_hz = if n_contour_bins > 0 && full_contour.len() >= total_stitched_frames * n_contour_bins {
-            analyze_contour_for_events(
-                &mut notes,
-                &full_contour,
-                total_stitched_frames,
-                n_contour_bins,
-                cfg,
-            )
-        } else {
-            None
-        };
+        let estimated_a4_hz =
+            if n_contour_bins > 0 && full_contour.len() >= total_stitched_frames * n_contour_bins {
+                analyze_contour_for_events(
+                    &mut notes,
+                    &full_contour,
+                    total_stitched_frames,
+                    n_contour_bins,
+                    cfg,
+                )
+            } else {
+                None
+            };
 
-        let pruned_overtones = if cfg.enable_overtone_pruning {
-            prune_phantom_overtones(&mut notes, cfg)
-        } else {
-            0
-        };
+        let mut pruned_overtones = 0;
+        if cfg.enable_semitone_bleed_pruning {
+            pruned_overtones += prune_semitone_bleed(&mut notes);
+        }
+        if cfg.enable_overtone_pruning {
+            pruned_overtones += prune_phantom_overtones(&mut notes, cfg);
+        }
 
         let chords = group_notes_into_chords(&notes, cfg);
         Ok(WindowTranscription {
@@ -447,6 +450,35 @@ impl BasicPitchEngine {
             pruned_overtones,
         })
     }
+}
+
+/// Suavização mediana temporal de 3 frames no tensor `note` (elimina picos espúrios de 1 frame sem atrasar ataques).
+fn temporal_smooth_notes(notes: &[f32], n_frames: usize, n_bins: usize) -> Vec<f32> {
+    if n_frames < 3 || n_bins == 0 {
+        return notes.to_vec();
+    }
+    let mut out = notes.to_vec();
+    for t in 1..(n_frames - 1) {
+        let prev = (t - 1) * n_bins;
+        let curr = t * n_bins;
+        let next = (t + 1) * n_bins;
+        for p in 0..n_bins {
+            let mut a = notes[prev + p];
+            let mut b = notes[curr + p];
+            let mut c = notes[next + p];
+            if a > b {
+                std::mem::swap(&mut a, &mut b);
+            }
+            if b > c {
+                std::mem::swap(&mut b, &mut c);
+            }
+            if a > b {
+                std::mem::swap(&mut a, &mut b);
+            }
+            out[curr + p] = b;
+        }
+    }
+    out
 }
 
 fn decode_polyphonic_notes(
@@ -458,6 +490,7 @@ fn decode_polyphonic_notes(
 ) -> Vec<PolyNoteEvent> {
     let mut events = Vec::new();
     let idx = |t: usize, p: usize| -> usize { t * n_bins + p };
+    let sustain_thr = cfg.sustain_threshold.min(cfg.frame_threshold);
 
     for p in 0..n_bins {
         let midi = MIDI_OFFSET + p as u8;
@@ -478,7 +511,6 @@ fn decode_polyphonic_notes(
                 && onset_val > onsets[idx(t + 1, p)]
                 && note_val >= cfg.frame_threshold;
 
-            // Gatilho de legato/sustentação: captura voz, cordas e ligados sem pico de onset
             let is_legato_entry = !is_onset_peak
                 && note_val >= cfg.legato_frame_threshold
                 && prev_note < cfg.legato_frame_threshold;
@@ -494,7 +526,8 @@ fn decode_polyphonic_notes(
                     if frame_val > peak_conf {
                         peak_conf = frame_val;
                     }
-                    if frame_val < cfg.frame_threshold {
+                    // Histerese: exige nível mais alto para abrir a nota e nível menor para sustentá-la
+                    if frame_val < sustain_thr {
                         quiet_streak += 1;
                         if quiet_streak >= 3 {
                             end = end.saturating_sub(2);
@@ -521,7 +554,6 @@ fn decode_polyphonic_notes(
                     } else {
                         peak_conf * 0.78
                     };
-                    // Funde micro-lacunas na mesma altura (vibrato/respiração) sem re-ataque forte
                     let merged = if let Some(prev) = pitch_events.last_mut() {
                         if !is_onset_peak && start <= prev.end_frame + cfg.merge_gap_frames {
                             prev.end_frame = prev.end_frame.max(end);
@@ -665,6 +697,55 @@ pub fn analyze_contour_for_events(
     Some(estimated_a4.clamp(415.0, 466.0))
 }
 
+/// Remove vazamentos espectrais de semitom adjacente (`±1` semitom) causados por vibrato, distorção ou largura de banda CQT.
+pub fn prune_semitone_bleed(events: &mut Vec<PolyNoteEvent>) -> usize {
+    if events.len() < 2 {
+        return 0;
+    }
+
+    let mut removed = vec![false; events.len()];
+    for i in 0..events.len() {
+        if removed[i] {
+            continue;
+        }
+        for j in (i + 1)..events.len() {
+            if removed[j] {
+                continue;
+            }
+            let a = &events[i];
+            let b = &events[j];
+            if a.midi_note.abs_diff(b.midi_note) != 1 {
+                continue;
+            }
+            let start_close = a.start_frame.abs_diff(b.start_frame) <= 4;
+            let overlap = a.end_frame.min(b.end_frame) > a.start_frame.max(b.start_frame) + 1;
+            if !start_close && !overlap {
+                continue;
+            }
+
+            let score_a = a.confidence * 0.6 + a.onset_confidence * 0.4;
+            let score_b = b.confidence * 0.6 + b.onset_confidence * 0.4;
+
+            if score_b < score_a * 0.76 && b.onset_confidence < 0.72 {
+                removed[j] = true;
+            } else if score_a < score_b * 0.76 && a.onset_confidence < 0.72 {
+                removed[i] = true;
+                break;
+            }
+        }
+    }
+
+    let pruned = removed.iter().filter(|&&r| r).count();
+    let mut idx = 0usize;
+    events.retain(|_| {
+        let keep = !removed[idx];
+        idx += 1;
+        keep
+    });
+    pruned
+}
+
+/// Remove harmônicos fantasma acima (+12, +19, +24, +28) e sub-oitavas fantasma abaixo (-12).
 pub fn prune_phantom_overtones(events: &mut Vec<PolyNoteEvent>, cfg: &DecodeConfig) -> usize {
     if events.len() < 2 {
         return 0;
@@ -677,37 +758,47 @@ pub fn prune_phantom_overtones(events: &mut Vec<PolyNoteEvent>, cfg: &DecodeConf
         if removed[i] {
             continue;
         }
-        let fund = &events[i];
+        let low = &events[i];
 
         for j in (i + 1)..events.len() {
             if removed[j] {
                 continue;
             }
-            let cand = &events[j];
-            let interval = cand.midi_note.saturating_sub(fund.midi_note);
+            let high = &events[j];
+            let interval = high.midi_note.saturating_sub(low.midi_note);
             if interval > 28 {
                 break;
             }
 
-            let overlap_start = fund.start_frame.max(cand.start_frame);
-            let overlap_end = fund.end_frame.min(cand.end_frame);
+            let overlap_start = low.start_frame.max(high.start_frame);
+            let overlap_end = low.end_frame.min(high.end_frame);
             let overlaps = overlap_end > overlap_start + 1
-                || cand.start_frame.abs_diff(fund.start_frame) <= 3;
+                || high.start_frame.abs_diff(low.start_frame) <= 3;
             if !overlaps {
                 continue;
             }
 
-            let is_phantom = match interval {
+            // 1. Sub-oitava fantasma (nota mais grave muito mais fraca que a nota 1 oitava acima)
+            if interval == 12
+                && low.onset_confidence < high.onset_confidence * 0.56
+                && low.confidence < high.confidence * 0.65
+            {
+                removed[i] = true;
+                break;
+            }
+
+            // 2. Sobretons fantasma acima da fundamental
+            let is_phantom_overtone = match interval {
                 12 => {
-                    cand.onset_confidence < fund.onset_confidence * cfg.overtone_octave_ratio
-                        && cand.confidence < fund.confidence * 0.90
+                    high.onset_confidence < low.onset_confidence * cfg.overtone_octave_ratio
+                        && high.confidence < low.confidence * 0.90
                 }
-                19 => cand.onset_confidence < fund.onset_confidence * cfg.overtone_fifth_ratio,
-                24 | 28 => cand.onset_confidence < fund.onset_confidence * 0.65,
+                19 => high.onset_confidence < low.onset_confidence * cfg.overtone_fifth_ratio,
+                24 | 28 => high.onset_confidence < low.onset_confidence * 0.65,
                 _ => false,
             };
 
-            if is_phantom {
+            if is_phantom_overtone {
                 removed[j] = true;
             }
         }
@@ -742,15 +833,10 @@ fn group_notes_into_chords(events: &[PolyNoteEvent], cfg: &DecodeConfig) -> Vec<
     let mut out: Vec<ChordEvent> = Vec::with_capacity(groups.len());
 
     for mut g in groups {
-        let peak_conf = g
-            .iter()
-            .map(|e| e.confidence)
-            .fold(0.0f32, f32::max);
+        let peak_conf = g.iter().map(|e| e.confidence).fold(0.0f32, f32::max);
         let min_keep_conf = peak_conf * cfg.relative_salience_ratio;
 
-        // Filtra vazamentos muito mais fracos que a nota principal do instante
         g.retain(|e| e.confidence >= min_keep_conf);
-        // Ordena por confiança decrescente e aplica o teto de polifonia do instrumento
         g.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
         g.truncate(max_voices);
 
@@ -764,10 +850,7 @@ fn group_notes_into_chords(events: &[PolyNoteEvent], cfg: &DecodeConfig) -> Vec<
             .map(|e| e.end_frame.saturating_sub(e.start_frame).max(1))
             .max()
             .unwrap_or(1);
-        let max_bend = g
-            .iter()
-            .map(|e| e.bend_semitones)
-            .fold(0.0f32, f32::max);
+        let max_bend = g.iter().map(|e| e.bend_semitones).fold(0.0f32, f32::max);
         let mean_warmth = g.iter().map(|e| e.timbral_warmth).sum::<f32>() / (g.len() as f32);
 
         let unique_notes: Vec<u8> = g
@@ -799,7 +882,6 @@ mod tests {
         let sr_out = MODEL_SAMPLE_RATE;
         let n = 4800;
 
-        // 1 kHz (banda útil) -> deve passar intacto
         let pass_in: Vec<f32> = (0..n)
             .map(|i| (2.0 * PI * 1000.0 * (i as f64) / sr_in).sin() as f32)
             .collect();
@@ -810,7 +892,6 @@ mod tests {
         let rms_pass = (mid_p.iter().map(|&x| x * x).sum::<f32>() / mid_p.len() as f32).sqrt();
         assert!(rms_pass > 0.65, "1 kHz deveria passar sem perda (rms={})", rms_pass);
 
-        // 18 kHz (acima da Nyquist de 22.05 kHz!) -> deve ser rejeitado (> 40 dB)
         let stop_in: Vec<f32> = (0..n)
             .map(|i| (2.0 * PI * 18_000.0 * (i as f64) / sr_in).sin() as f32)
             .collect();
@@ -820,5 +901,48 @@ mod tests {
         let mid_s = &stop_out[stop_out.len() / 4..(stop_out.len() * 3) / 4];
         let rms_stop = (mid_s.iter().map(|&x| x * x).sum::<f32>() / mid_s.len() as f32).sqrt();
         assert!(rms_stop < 0.005, "18 kHz deveria ser rejeitado pelo anti-aliasing (rms={})", rms_stop);
+    }
+
+    #[test]
+    fn prunes_adjacent_semitone_bleed_and_sub_octave_ghosts() {
+        let mut evs = vec![
+            PolyNoteEvent {
+                midi_note: 52, // sub-oitava fraca fantasma de 64
+                start_frame: 10,
+                end_frame: 26,
+                confidence: 0.42,
+                onset_confidence: 0.35,
+                bend_semitones: 0.0,
+                median_cents: 0.0,
+                timbral_warmth: 0.5,
+            },
+            PolyNoteEvent {
+                midi_note: 64, // nota real E4
+                start_frame: 10,
+                end_frame: 30,
+                confidence: 0.90,
+                onset_confidence: 0.88,
+                bend_semitones: 0.0,
+                median_cents: 0.0,
+                timbral_warmth: 0.5,
+            },
+            PolyNoteEvent {
+                midi_note: 65, // vazamento de semitom adjacente F4
+                start_frame: 11,
+                end_frame: 25,
+                confidence: 0.48,
+                onset_confidence: 0.45,
+                bend_semitones: 0.0,
+                median_cents: 0.0,
+                timbral_warmth: 0.5,
+            },
+        ];
+
+        let bleed = prune_semitone_bleed(&mut evs);
+        let ov = prune_phantom_overtones(&mut evs, &DecodeConfig::default());
+        assert_eq!(bleed, 1);
+        assert_eq!(ov, 1);
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].midi_note, 64);
     }
 }

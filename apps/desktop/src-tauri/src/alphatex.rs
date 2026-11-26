@@ -106,12 +106,12 @@ pub fn get_tuning_preset(id: &str) -> TuningPreset {
         },
         "piano" => TuningPreset {
             id: "piano",
-            label: "Piano / Teclado",
+            label: "Piano / Teclado (Sol + Fá)",
             midi_low_to_high: vec![40, 45, 50, 55, 59, 64],
             alphatex_high_to_low: "E4 B3 G3 D3 A2 E2",
             midi_program: 0,
             show_tab_staff: false,
-            clef: ClefKind::Treble,
+            clef: ClefKind::GrandStaff,
             allow_bends: false,
         },
         "vocals" => TuningPreset {
@@ -136,7 +136,7 @@ pub fn get_tuning_preset(id: &str) -> TuningPreset {
         },
         "cello" => TuningPreset {
             id: "cello",
-            label: "Violoncelo / Contrabaixo Arco",
+            label: "Violoncelo",
             midi_low_to_high: vec![36, 43, 50, 57],
             alphatex_high_to_low: "A3 D3 G2 C2",
             midi_program: 42,
@@ -156,12 +156,12 @@ pub fn get_tuning_preset(id: &str) -> TuningPreset {
         },
         "synth" => TuningPreset {
             id: "synth",
-            label: "Synth / Lead",
+            label: "Synth / Teclado",
             midi_low_to_high: vec![40, 45, 50, 55, 59, 64],
             alphatex_high_to_low: "E4 B3 G3 D3 A2 E2",
             midi_program: 81,
             show_tab_staff: false,
-            clef: ClefKind::Treble,
+            clef: ClefKind::GrandStaff,
             allow_bends: false,
         },
         _ => TuningPreset {
@@ -177,9 +177,14 @@ pub fn get_tuning_preset(id: &str) -> TuningPreset {
     }
 }
 
-pub fn empty_score_tex(preset: &TuningPreset, ts: TimeSignature) -> String {
-    let empty = build_empty_score("Tab Transcriber", &preset.midi_low_to_high, 100, ts)
-        .with_instrument(preset.midi_program, preset.show_tab_staff, preset.clef);
-    let subtitle = format!("{} · {}", preset.label, ts.display_label());
-    score_to_alphatex(&empty, preset.alphatex_high_to_low, &subtitle)
+pub fn empty_score_tex(preset: &TuningPreset, ts: TimeSignature, clef_override: Option<ClefKind>) -> String {
+    let eff_clef = clef_override.unwrap_or(preset.clef);
+    let show_tab = if eff_clef == ClefKind::GrandStaff {
+        false
+    } else {
+        preset.show_tab_staff
+    };
+    let empty = build_empty_score("", &preset.midi_low_to_high, 100, ts)
+        .with_instrument(preset.midi_program, show_tab, eff_clef);
+    score_to_alphatex(&empty, preset.alphatex_high_to_low, "")
 }

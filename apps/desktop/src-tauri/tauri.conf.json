@@ -25,6 +25,22 @@
     }
   },
   "bundle": {
-    "active": false
+    "active": true,
+    "targets": [
+      "app",
+      "dmg"
+    ],
+    "category": "Music",
+    "shortDescription": "Transcritor musical local com loopback Core Audio, HTDemucs 6-stems e AlphaTab.",
+    "resources": {
+      "../../../models/nmp.onnx": "models/nmp.onnx",
+      "../../../scripts/separate_stems.py": "scripts/separate_stems.py",
+      "../../../scripts/transcribe_neural.py": "scripts/transcribe_neural.py"
+    },
+    "macOS": {
+      "minimumSystemVersion": "14.2",
+      "frameworks": [],
+      "entitlements": null
+    }
   }
 }

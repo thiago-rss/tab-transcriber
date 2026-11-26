@@ -99,6 +99,17 @@
             </select>
           </label>
 
+          <label class="field">
+            <span>Clave</span>
+            <select id="clef-select">
+              <option value="auto" selected>Auto (Separação Inteligente)</option>
+              <option value="grand">Sol + Fá (Grand Staff)</option>
+              <option value="treble">Clave de Sol (G2)</option>
+              <option value="treble8vb">Clave de Sol 8vb (Guitarra)</option>
+              <option value="bass">Clave de Fá (F4)</option>
+            </select>
+          </label>
+
           <label class="field" id="region-field">
             <span>Região do Braço</span>
             <select id="region-select">
@@ -155,6 +166,8 @@
           </label>
 
           <div class="actions">
+            <button id="loopback-btn" type="button" title="Capturar/monitorar áudio loopback sem executar nenhuma transcrição">Loopback</button>
+            <label class="inline-check" title="Quando marcado, salva o áudio do Loopback Puro em WAV 24-bit ao parar"><input id="loopback-rec-chk" type="checkbox" /> WAV</label>
             <button id="toggle-btn" class="primary" type="button">Ao Vivo</button>
             <button id="clear-btn" type="button">Limpar</button>
             <button id="export-xml-btn" type="button" title="Exportar MusicXML 4.0">MusicXML</button>
@@ -174,10 +187,21 @@
             Cancelar
           </button>
           <span class="mono" id="rec-timer">00:00</span>
+          <button id="import-audio-btn" type="button" title="Importar WAV, MP3, M4A, FLAC ou AIFF direto para separação e transcrição">Abrir Áudio</button>
+
+          <select id="saved-sessions-select" title="Reabrir uma sessão de stems já separada sem rodar o HTDemucs novamente">
+            <option value="">Sessões Salvas (0)</option>
+          </select>
 
           <select id="stem-quality-select" title="Qualidade da separação HTDemucs">
             <option value="high" selected>Alta Fidelidade (24-bit)</option>
             <option value="fast">Rápido (1 shift)</option>
+          </select>
+
+          <select id="neural-engine-select" title="Motor neural de transcrição offline e grade de batidas">
+            <option value="auto" selected>Auto (MuScriptor + Beat This!)</option>
+            <option value="muscriptor">MuScriptor (MPS)</option>
+            <option value="basic_pitch">Basic Pitch + Beat This!</option>
           </select>
 
           <select id="stem-select" title="Instrumento isolado para transcrever">
